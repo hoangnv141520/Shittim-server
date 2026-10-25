@@ -1,0 +1,340 @@
+using BlueArchiveAPI.Services;
+using Microsoft.EntityFrameworkCore;
+using Schale.Data;
+using Schale.MX.NetworkProtocol;
+using Schale.MX.GameLogic.DBModel;
+using Schale.MX.GameLogic.Parcel;
+using Schale.Data.GameModel;
+using Shittim_Server.Core;
+using Shittim_Server.Services;
+using Schale.FlatData;
+
+namespace Shittim_Server.Core.NetworkProtocol.Handlers;
+
+public class BattlePassHandler : ProtocolHandlerBase
+{
+    private readonly ISessionKeyService _sessionService;
+    private readonly ExcelTableService _excelTableService;
+    private readonly ParcelHandler _parcelHandler;
+
+    public BattlePassHandler(
+        IProtocolHandlerRegistry registry,
+        ISessionKeyService sessionService,
+        ExcelTableService excelTableService,
+        ParcelHandler parcelHandler) : base(registry)
+    {
+        _sessionService = sessionService;
+        _excelTableService = excelTableService;
+        _parcelHandler = parcelHandler;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_Check)]
+    public async Task<BattlePassCheckResponse> Check(
+        SchaleDataContext db,
+        BattlePassCheckRequest request,
+        BattlePassCheckResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        return response;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_GetInfo)]
+    public async Task<BattlePassGetInfoResponse> GetInfo(
+        SchaleDataContext db,
+        BattlePassGetInfoRequest request,
+        BattlePassGetInfoResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        var battlePass = await db.BattlePasses
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.BattlePassId == request.BattlePassId);
+
+        if (battlePass == null)
+        {
+            battlePass = new BattlePassDBServer
+            {
+                AccountServerId = account.ServerId,
+                BattlePassId = request.BattlePassId,
+                PassLevel = 1,
+                PassExp = 0,
+                PurchaseGroupId = 0,
+                ReceiveRewardLevel = 0,
+                ReceivePurchaseRewardLevel = 0,
+                WeeklyPassExp = 0,
+                LastWeeklyPassExpLimitRefreshDate = account.GameSettings.ServerDateTime()
+            };
+            
+            db.BattlePasses.Add(battlePass);
+            await db.SaveChangesAsync();
+        }
+
+        response.BattlePassInfo = battlePass;
+
+        return response;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_ReceiveReward)]
+    public async Task<BattlePassReceiveRewardResponse> ReceiveReward(
+        SchaleDataContext db,
+        BattlePassReceiveRewardRequest request,
+        BattlePassReceiveRewardResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        var battlePass = await db.BattlePasses
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.BattlePassId == request.BattlePassId);
+
+        if (battlePass == null)
+            throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, "Battle Pass not found");
+
+        var battlePassInfoExcel = _excelTableService.GetTable<BattlePassInfoExcelT>()
+            .FirstOrDefault(x => x.Id == request.BattlePassId);
+
+        if (battlePassInfoExcel == null)
+            throw new WebAPIException(WebAPIErrorCode.BattlePassSeasonNotOpen, "Battle Pass Info not found");
+
+        var rewardExcels = _excelTableService.GetTable<BattlePassRewardExcelT>();
+        var parcels = new List<ParcelInfo>();
+
+        if (battlePass.ReceiveRewardLevel < battlePass.PassLevel)
+        {
+            var newRewards = rewardExcels.Where(x => 
+                x.RewardGroupId == battlePassInfoExcel.FreeRewardGroupID && 
+                x.Level > battlePass.ReceiveRewardLevel && 
+                x.Level <= battlePass.PassLevel);
+
+            foreach (var reward in newRewards)
+            {
+                parcels.Add(new ParcelInfo
+                {
+                    Key = new ParcelKeyPair { Type = reward.RewardParcelType, Id = reward.RewardParcelUniqueId },
+                    Amount = reward.RewardParcelAmount
+                });
+            }
+            battlePass.ReceiveRewardLevel = battlePass.PassLevel;
+        }
+
+        if (battlePass.PurchaseGroupId != 0 && battlePass.ReceivePurchaseRewardLevel < battlePass.PassLevel)
+        {
+            var newPaidRewards = rewardExcels.Where(x => 
+                x.RewardGroupId == battlePassInfoExcel.PurchaseRewardGroupID && 
+                x.Level > battlePass.ReceivePurchaseRewardLevel && 
+                x.Level <= battlePass.PassLevel);
+
+            foreach (var reward in newPaidRewards)
+            {
+                parcels.Add(new ParcelInfo
+                {
+                    Key = new ParcelKeyPair { Type = reward.RewardParcelType, Id = reward.RewardParcelUniqueId },
+                    Amount = reward.RewardParcelAmount
+                });
+            }
+            battlePass.ReceivePurchaseRewardLevel = battlePass.PassLevel;
+        }
+
+        var parcelResultDB = new ParcelResultDB();
+        if (parcels.Any())
+        {
+            await _parcelHandler.BuildParcel(db, account, parcels, parcelResultDB);
+        }
+
+        await db.SaveChangesAsync();
+
+        response.BattlePassInfo = battlePass;
+        response.ParcelResult = parcelResultDB;
+
+        return response;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_BuyLevel)]
+    public async Task<BattlePassBuyLevelResponse> BuyLevel(
+        SchaleDataContext db,
+        BattlePassBuyLevelRequest request,
+        BattlePassBuyLevelResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        var battlePass = await db.BattlePasses
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.BattlePassId == request.BattlePassId);
+
+        if (battlePass == null)
+            throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, "Battle Pass not found");
+
+        // Levels are granted free.
+        // Cost (PassLvUpGoodsID / amount per level from BattlePassLevelExcel) is not charged, and the level is not capped against the excel max.
+        battlePass.PassLevel += request.BattlePassBuyLevelCount;
+
+        await db.SaveChangesAsync();
+
+        response.BattlePassInfo = battlePass;
+
+        // Client syncs currency off this response, so echo the current state back.
+        var currency = await db.Currencies.FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId);
+        if (currency != null)
+        {
+            response.AccountCurrencyDB = new AccountCurrencyDB
+            {
+                AccountLevel = currency.AccountLevel,
+                AcademyLocationRankSum = currency.AcademyLocationRankSum,
+                CurrencyDict = currency.CurrencyDict,
+                UpdateTimeDict = currency.UpdateTimeDict
+            };
+        }
+
+        return response;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_MissionList)]
+    public async Task<BattlePassMissionListResponse> MissionList(
+        SchaleDataContext db,
+        BattlePassMissionListRequest request,
+        BattlePassMissionListResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        var missionTable = _excelTableService.GetTable<BattlePassMissionExcelT>();
+        var bpMissions = missionTable.Where(x => x.BattlePassId == request.BattlePassId).Select(x => x.Id).ToList();
+
+        var missionProgresses = await db.MissionProgresses
+            .Where(x => x.AccountServerId == account.ServerId && bpMissions.Contains(x.MissionUniqueId))
+            .ToListAsync();
+
+        response.ProgressDBs = missionProgresses.Select(x => new MissionProgressDB
+        {
+            MissionUniqueId = x.MissionUniqueId,
+            ProgressParameters = x.ProgressParameters,
+            StartTime = x.StartTime,
+            Complete = x.Complete,
+            ServerId = x.ServerId,
+            AccountServerId = x.AccountServerId
+        }).ToList();
+
+        response.MissionHistoryUniqueIds = missionProgresses
+            .Where(x => x.Complete)
+            .Select(x => x.MissionUniqueId)
+            .ToList();
+
+        return response;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_MissionSingleReward)]
+    public async Task<BattlePassMissionSingleRewardResponse> MissionSingleReward(
+        SchaleDataContext db,
+        BattlePassMissionSingleRewardRequest request,
+        BattlePassMissionSingleRewardResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        var missionExcel = _excelTableService.GetTable<BattlePassMissionExcelT>()
+            .FirstOrDefault(x => x.BattlePassId == request.BattlePassId && x.Id == request.MissionUniqueId);
+
+        if (missionExcel == null)
+            throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, "Battle Pass mission not found");
+
+        var missionProgress = await db.MissionProgresses
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.MissionUniqueId == request.MissionUniqueId);
+
+        if (missionProgress == null || !missionProgress.Complete)
+            throw new WebAPIException(WebAPIErrorCode.MissionCannotComplete, "Battle Pass mission is not complete");
+
+        var battlePass = await db.BattlePasses
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.BattlePassId == request.BattlePassId);
+
+        if (battlePass == null)
+            throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, "Battle Pass not found");
+
+        // pass missions pay out in pass exp, not parcels; the level rewards themselves go through ReceiveReward
+        AddPassExp(battlePass, request.BattlePassId, missionExcel.BattlePassExpAmount);
+
+        db.MissionProgresses.Remove(missionProgress);
+
+        var completeTime = account.GameSettings.ServerDateTime();
+        db.MissionHistories.Add(new MissionHistoryDBServer
+        {
+            AccountServerId = account.ServerId,
+            MissionUniqueId = missionProgress.MissionUniqueId,
+            CompleteTime = completeTime
+        });
+
+        await db.SaveChangesAsync();
+
+        // Official's wire history carries only these two members - the detailed capture shows ServerId and AccountServerId omitted.
+        response.AddedHistoryDB = new MissionHistoryDB
+        {
+            MissionUniqueId = missionProgress.MissionUniqueId,
+            CompleteTime = completeTime
+        };
+        response.ParcelResultDB = new ParcelResultDB();
+        response.BattlePassInfo = battlePass;
+
+        return response;
+    }
+
+    [ProtocolHandler(Protocol.BattlePass_MissionMultipleReward)]
+    public async Task<BattlePassMissionMultipleRewardResponse> MissionMultipleReward(
+        SchaleDataContext db,
+        BattlePassMissionMultipleRewardRequest request,
+        BattlePassMissionMultipleRewardResponse response)
+    {
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+
+        var missionExcels = _excelTableService.GetTable<BattlePassMissionExcelT>()
+            .Where(x => x.BattlePassId == request.BattlePassId
+                && (request.MissionCategory == MissionCategory.All || x.Category == request.MissionCategory))
+            .ToDictionary(x => x.Id, x => x);
+
+        var targetProgresses = db.MissionProgresses
+            .Where(x => x.AccountServerId == account.ServerId && x.Complete)
+            .ToList()
+            .Where(x => missionExcels.ContainsKey(x.MissionUniqueId))
+            .ToList();
+
+        var battlePass = await db.BattlePasses
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.BattlePassId == request.BattlePassId);
+
+        if (battlePass == null)
+            throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, "Battle Pass not found");
+
+        var addedHistory = new List<MissionHistoryDB>();
+        foreach (var progress in targetProgresses)
+        {
+            AddPassExp(battlePass, request.BattlePassId, missionExcels[progress.MissionUniqueId].BattlePassExpAmount);
+
+            var completeTime = account.GameSettings.ServerDateTime();
+            db.MissionHistories.Add(new MissionHistoryDBServer
+            {
+                AccountServerId = account.ServerId,
+                MissionUniqueId = progress.MissionUniqueId,
+                CompleteTime = completeTime
+            });
+            addedHistory.Add(new MissionHistoryDB
+            {
+                MissionUniqueId = progress.MissionUniqueId,
+                CompleteTime = completeTime
+            });
+        }
+
+        db.MissionProgresses.RemoveRange(targetProgresses);
+        await db.SaveChangesAsync();
+
+        response.AddedHistoryDBs = addedHistory;
+        response.ParcelResultDB = new ParcelResultDB();
+        response.BattlePassInfo = battlePass;
+
+        return response;
+    }
+
+    private void AddPassExp(BattlePassDBServer battlePass, long battlePassId, int amount)
+    {
+        battlePass.PassExp += amount;
+        battlePass.WeeklyPassExp += amount;
+
+        var needExp = _excelTableService.GetTable<BattlePassInfoExcelT>().FirstOrDefault(x => x.Id == battlePassId)?.NextLvNeedExp ?? 0;
+        while (needExp > 0 && battlePass.PassExp >= needExp)
+        {
+            battlePass.PassExp -= needExp;
+            battlePass.PassLevel += 1;
+        }
+    }
+}

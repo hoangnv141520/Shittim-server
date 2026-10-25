@@ -1,0 +1,135 @@
+# Request logs containing sensitive data
+requests/
+request_logs/
+captures/
+/data/
+nexon.har
+nexon.flows
+protocol_dump.cleaned.json
+*.har
+/Shittim-Server/shittim.sqlite3
+/Shittim-Server/shittim.sqlite3-shm
+/Shittim-Server/shittim.sqlite3-wal
+/JP_Dev
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# SSL certificates and keys
+*.pem
+*.key
+*.crt
+*.cert
+*.pfx
+*.p12
+
+# TLS key log (Wireshark)
+sslkey.log
+*.keylog
+
+# Env files
+.env.*
+*.env
+
+# Dumps
+*.dmp
+*.crash
+
+# Generic logs
+*.log
+
+# .NET build outputs
+**/bin/
+**/obj/
+Schale/bin/
+*.dll
+*.exe
+*.pdb
+
+# Python packaging outputs
+/build/
+/dist/
+/*.spec
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+hosts.bak
+hosts.backup
+
+# Protocol dump + local dump tooling/cache
+/protocol_dump.log
+/Scripts/tidy_protocol_dump.ps1
+/Scripts/cheatengine_protocol_dump.lua
+/startcontrol.ps1
+
+# Reverse-engineering / debugging artifacts
+Tools/procdump/
+Tools/cdb_*.txt
+Tools/*_trace.txt
+Tools/*.bin
+Tools/server_run*.log
+TESTING_ISSUES.txt
+*.i64
+*.idb
+*.til
+*.nam
+
+# Large IL2CPP metadata dumps (generated; exceed GitHub's 100 MB file limit).
+# Kept locally only - the small il2cpp.py extractor stays tracked.
+ida_pro_metadata/il2cpp.json
+ida_pro_metadata/il2cpp.h
+
+# Names the host it pushes to.
+docs/deploy.sh
+
+# Large binaries and Android APK / mod outputs (> 50-100 MB)
+ba_apk/
+ba_mod/
+publish_arm64/
+*.apk
+*.db
+Resources/
+*.log
+redirect_requests.log
+device_libgadget.so
+device_libunity.so
+
+# Project requirement: ALWAYS track Shittim-Server/config and every file inside it.
+# These negations MUST stay at the end of the file so they override the *.pem,
+# *.key, *.crt and other rules above (Git uses last-match-wins).
+!/Shittim-Server/config/
+!/Shittim-Server/config/**
+

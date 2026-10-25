@@ -1,0 +1,68 @@
+name: Release Control Center
+
+# Builds and publishes the Shittim Control Center desktop app to GitHub Releases
+# via electron-builder, which also produces the `latest.yml` update feed that the
+# app's electron-updater reads to self-update. Running this from a GitHub-hosted
+# runner uploads the (~80 MB) installers from GitHub's own network, avoiding the
+# ECONNRESET/TLS drops that interrupt large uploads from a local machine.
+#
+# Usage:
+#   1. Bump "version" in ShittimControlCenter/package.json and commit/push it
+#      (electron-updater compares this semver to decide an update is available; it has
+#      to be valid semver - no leading zeros and no extra dotted suffix, so 2026.9.15
+#      rather than 2026.9.13.d2).
+#   2. Push a v<that version> tag, or run this from the Actions tab.
+#   3. The release goes LIVE immediately when the workflow finishes
+#      (publish.releaseType is "release", not electron-builder's draft default) -
+#      installed apps will start picking it up on their next launch, so only run
+#      this on a commit you're happy to ship.
+#
+# Note: the NSIS "Setup" (installed) build self-updates in place; portable users
+# get an update notice with a link to the download page.
+#
+# Both this and "Build and Release Shittim Server" listen on the same tag, so they share
+# a concurrency group and run one after the other rather than racing to create the same
+# release. electron-builder uploads to tag v<package.json version>; the server workflow
+# separately checks that against Directory.Build.props.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ShittimControlCenter
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      # Nothing used to test this tree before publishing it. The renderer's own suite is quick and it is the only thing that catches a locale file that has drifted, so it runs before anything is uploaded - a release here is live the moment it finishes.
+      - name: Run tests
+        run: npm test
+
+      - name: Build & publish to GitHub Releases
+        env:
+          # electron-builder reads GH_TOKEN to publish; the built-in token has the
+          # contents:write permission granted above, so no PAT/secret is needed.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run publish

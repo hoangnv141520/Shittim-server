@@ -1,0 +1,497 @@
+using AutoMapper;
+using BlueArchiveAPI.Services;
+using Microsoft.EntityFrameworkCore;
+using Schale.Data;
+using Schale.Data.GameModel;
+using Schale.Excel;
+using Schale.Data.ModelMapping;
+using Schale.FlatData;
+using Schale.MX.GameLogic.DBModel;
+using Schale.MX.GameLogic.Parcel;
+using Schale.MX.NetworkProtocol;
+
+namespace Shittim_Server.Services;
+
+public class ShopManager
+{
+    private readonly ExcelTableService _excelTableService;
+    private readonly SharedDataCacheService _sharedDataCacheService;
+    private readonly ParcelHandler _parcelHandler;
+    private readonly IMapper _mapper;
+
+    private readonly List<ItemExcelT> _itemExcels;
+    private readonly List<GoodsExcelT> _goodsExcels;
+    private readonly List<PickupDuplicateBonusExcelT> _pickupDuplicateBonusExcels;
+    private readonly List<ShopRecruitExcelT> _shopRecruitmentExcels;
+    private readonly List<CharacterExcelT> _characterExcels;
+
+    public ShopManager(
+        ExcelTableService excelTableService,
+        SharedDataCacheService sharedDataCacheService,
+        ParcelHandler parcelHandler,
+        IMapper mapper)
+    {
+        _excelTableService = excelTableService;
+        _sharedDataCacheService = sharedDataCacheService;
+        _parcelHandler = parcelHandler;
+        _mapper = mapper;
+
+        _itemExcels = _excelTableService.GetTable<ItemExcelT>();
+        _goodsExcels = _excelTableService.GetTable<GoodsExcelT>();
+        _pickupDuplicateBonusExcels = _excelTableService.GetTable<PickupDuplicateBonusExcelT>();
+        _shopRecruitmentExcels = _excelTableService.GetTable<ShopRecruitExcelT>();
+        _characterExcels = _excelTableService.GetTable<CharacterExcelT>()
+            .GetReleaseCharacters().ToList();
+    }
+
+    public async Task<(AccountCurrencyDB, List<ItemDB>?, long)> ConsumeCurrency(
+        SchaleDataContext context, AccountDBServer account, ShopBuyGacha3Request req)
+    {
+        long gachaAmount = 10;
+        List<ItemDB> consumedItems = [];
+
+        if (req.Cost == null)
+        {
+             var currentCurrencyEntity = context.GetAccountCurrencies(account.ServerId).FirstOrDefault();
+             var currentCurrencyDB = currentCurrencyEntity?.ToMap(_mapper) ?? new AccountCurrencyDB();
+             return (currentCurrencyDB, consumedItems, gachaAmount);
+        }
+
+        var parcelConsume = ParcelResult.ConvertParcelResult(req.Cost.ParcelInfos);
+        foreach (var parcel in parcelConsume)
+        {
+            gachaAmount = parcel.Type switch
+            {
+                ParcelType.Currency => parcel.Amount / 120,
+                ParcelType.Item => GachaService.GetGachaAmountByItem(_itemExcels, parcel.Id),
+                _ => 10,
+            };
+        }
+        var parcelResolver = await _parcelHandler.BuildParcel(context, account, parcelConsume, isConsume: true);
+        if (parcelResolver.ParcelResult.ItemDBs.Count > 0)
+            consumedItems.AddRange(parcelResolver.ParcelResult.ItemDBs.Values);
+
+        return (parcelResolver.ParcelResult.AccountCurrencyDB, consumedItems, gachaAmount);
+    }
+
+    // The recruit point exchange arrives on the gacha protocols, not Shop_BuyMerchandise: the client's ShopRecruitBuyStudentNetworkTask sends Shop_BuyGacha3 (Shop_PickupSelectionGachaBuy on selection banners) with GoodsId pointing at the RecruitSellection goods and Cost carrying the coins. That goods rewards the chosen character directly, so it must never be rolled as a ten-pull.
+    public async Task<(AccountCurrencyDB, List<ItemDB>, List<GachaResult>)?> TryBuyStudent(
+        SchaleDataContext context, AccountDBServer account, ShopBuyGacha3Request req)
+    {
+        var goods = _goodsExcels.FirstOrDefault(x => x.Id == req.GoodsId);
+        if (goods == null || goods.ParcelType == null)
+            return null;
+
+        var characterSlot = goods.ParcelType.IndexOf(ParcelType.Character);
+        if (characterSlot < 0)
+            return null;
+
+        var (accountCurrency, consumedItems, _) = await ConsumeCurrency(context, account, req);
+
+        var character = _characterExcels.GetCharacter(goods.ParcelId[characterSlot]);
+        var gachaList = new List<GachaResult>();
+        var itemList = new List<ItemDBServer>();
+        await GachaService.AddGachaResult(context, account, _mapper, character, gachaList, itemList);
+
+        // the coin's post-consume stack rides AcquiredItems, same as the pull path reporting the coins it awards
+        var acquired = itemList.ToMapList(_mapper);
+        if (consumedItems != null)
+            acquired.AddRange(consumedItems);
+
+        return (accountCurrency, acquired, gachaList);
+    }
+
+    public async Task<(List<ItemDBServer>, List<GachaResult>)> CreateTenGacha(
+        SchaleDataContext context, AccountDBServer account, ShopBuyGacha3Request req, long gachaAmount)
+    {
+        var dateTime = account.GameSettings.ServerDateTime();
+
+        var ssrCharacterList = _sharedDataCacheService.CharaListSSRNormal;
+        var srCharacterList = _sharedDataCacheService.CharaListSRNormal;
+        var rCharacterList = _sharedDataCacheService.CharaListRNormal;
+        var uniqCharacterList = _sharedDataCacheService.CharaListUnique;
+        var festCharacterList = _sharedDataCacheService.CharaListFest;
+
+        var characterBanner = _shopRecruitmentExcels.FirstOrDefault(x => x.Id == req.ShopUniqueId);
+        if (characterBanner == null)
+        {
+            var availableIds = string.Join(", ", _shopRecruitmentExcels.Select(x => x.Id).OrderBy(x => x));
+            Console.WriteLine($"[ShopManager] Shop ID {req.ShopUniqueId} not found. Available IDs: {availableIds}");
+            
+            characterBanner = _shopRecruitmentExcels.FirstOrDefault(x => x.CategoryType == ShopCategoryType.NormalGacha);
+            if (characterBanner == null)
+            {
+                throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, $"Shop recruitment with ID {req.ShopUniqueId} not found. Available shops: {availableIds}");
+            }
+            Console.WriteLine($"[ShopManager] Falling back to normal gacha banner ID: {characterBanner.Id}");
+        }
+
+        var rateUpPickUp = new PickupDuplicateBonusExcelT();
+        var rateUpChar = new CharacterExcelT();
+        var otherRateUpList = new List<CharacterExcelT>();
+
+        if (characterBanner.CategoryType != ShopCategoryType.NormalGacha)
+        {
+            rateUpPickUp = _pickupDuplicateBonusExcels.GetPickupDuplicateBonusByShopId(req.ShopUniqueId);
+            rateUpChar = _characterExcels.GetCharacter(rateUpPickUp.PickupCharacterId);
+            var otherShopRecruitChars = _shopRecruitmentExcels
+                .GetAssignedCharacterIdShopRecruit().GetAssignedSaleShopRecruit()
+                .GetCategorizedShopRecruit(rateUpPickUp.ShopCategoryType).GetTimelinedShopRecruit(dateTime);
+            var characterIds = otherShopRecruitChars.SelectMany(x => x.InfoCharacterId);
+            foreach (long characterId in characterIds)
+            {
+                if (characterId == rateUpChar.Id) continue;
+                var character = _characterExcels.GetCharacter(characterId);
+                if (character != null) otherRateUpList.Add(character);
+            }
+        }
+
+        List<ShopCategoryType> allowedGachaTypes =
+        [
+            ShopCategoryType.PickupGacha,
+            ShopCategoryType.LimitedGacha
+        ];
+        const int guaranteedSRIndex = 9;
+        List<GachaResult> gachaList = new((int)gachaAmount);
+        List<ItemDBServer> itemList = [];
+        bool shouldDoGuaranteedSR = true;
+        bool hasSSR = false;
+
+        var (rateUpSSRRate, fesSSRRate, limitedSSRRate, permanentSSRRate, SRRate, isSelector) = GachaService.InitializeGachaRates(characterBanner.CategoryType);
+
+        var guaranteedCharIdOnce = Core.GachaCommand.GetGuaranteedCharacterId();
+        bool guaranteedUsed = false;
+
+        if (guaranteedCharIdOnce.HasValue)
+        {
+            Console.WriteLine($"[ShopManager] Guaranteed character active: {guaranteedCharIdOnce.Value}");
+        }
+
+        for (int i = 0; i < gachaAmount; i++)
+        {
+            if (guaranteedCharIdOnce.HasValue && !guaranteedUsed)
+            {
+                var guaranteedChar = _characterExcels.GetCharacter(guaranteedCharIdOnce.Value);
+                if (guaranteedChar != null)
+                {
+                    Console.WriteLine($"[ShopManager] Granting guaranteed character {guaranteedCharIdOnce.Value} on pull {i + 1}");
+                    await GachaService.AddGachaResult(context, account, _mapper, guaranteedChar, gachaList, itemList);
+                    hasSSR = true;
+                    guaranteedUsed = true;
+                    continue;
+                }
+            }
+
+            var randomNumber = Random.Shared.NextInt64(1000);
+            var customRates = Core.GachaCommand.GetCustomRates();
+            
+            if (i == 0)
+            {
+                Console.WriteLine($"[ShopManager] Custom rates count: {customRates.Count}");
+            }
+            
+            if (customRates.Count > 0)
+            {
+                double ssrThreshold = customRates.TryGetValue(3, out double ssrRate) ? ssrRate * 10 : 0;
+                double srThreshold = ssrThreshold + (customRates.TryGetValue(2, out double srRate) ? srRate * 10 : 0);
+                double rThreshold = srThreshold + (customRates.TryGetValue(1, out double rRate) ? rRate * 10 : 0);
+                
+                if (i == 0)
+                {
+                    Console.WriteLine($"[ShopManager] Using custom rates: SSR={ssrRate:F2}%, SR={srRate:F2}%, R={rRate:F2}%");
+                    Console.WriteLine($"[ShopManager] Thresholds: SSR={ssrThreshold}, SR={srThreshold}, R={rThreshold}");
+                    Console.WriteLine($"[ShopManager] Random number: {randomNumber}");
+                }
+                
+                if (randomNumber < ssrThreshold)
+                {
+                    var currentSSRCharacterList = !characterBanner.CategoryType.Equals(ShopCategoryType.NormalGacha)
+                        ? ssrCharacterList.Concat([rateUpChar]).Concat(otherRateUpList).DistinctBy(x => x.Id).ToList()
+                        : ssrCharacterList;
+                    await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(currentSSRCharacterList), gachaList, itemList);
+                    hasSSR = true;
+                }
+                else if (randomNumber < srThreshold)
+                {
+                    await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(srCharacterList), gachaList, itemList);
+                }
+                else
+                {
+                    await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(rCharacterList), gachaList, itemList);
+                }
+                continue;
+            }
+
+            if (randomNumber < rateUpSSRRate && !characterBanner.CategoryType.Equals(ShopCategoryType.NormalGacha))
+            {
+                await GachaService.AddGachaResult(context, account, _mapper, rateUpChar, gachaList, itemList);
+                hasSSR = true;
+            }
+            else if (randomNumber < rateUpSSRRate && allowedGachaTypes.Contains(characterBanner.CategoryType))
+            {
+                var currentFestCharacterList = festCharacterList.Concat(otherRateUpList).DistinctBy(x => x.Id).ToList();
+                await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(currentFestCharacterList), gachaList, itemList);
+                hasSSR = true;
+            }
+            else if (randomNumber < fesSSRRate && characterBanner.CategoryType.Equals(ShopCategoryType.FesGacha))
+            {
+                var currentFestCharacterList = festCharacterList.Concat(otherRateUpList).DistinctBy(x => x.Id).ToList();
+                await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(currentFestCharacterList), gachaList, itemList);
+                hasSSR = true;
+            }
+            else if (randomNumber < limitedSSRRate && limitedSSRRate > 0)
+            {
+                var currentUniqCharacterList = uniqCharacterList.Concat(otherRateUpList).DistinctBy(x => x.Id).ToList();
+                await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(currentUniqCharacterList), gachaList, itemList);
+                hasSSR = true;
+            }
+            else if (randomNumber < permanentSSRRate)
+            {
+                await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(ssrCharacterList, rateUpChar.Id, true), gachaList, itemList);
+                hasSSR = true;
+            }
+            else if (randomNumber < SRRate || (i == guaranteedSRIndex && shouldDoGuaranteedSR))
+                await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(srCharacterList), gachaList, itemList);
+            else
+                await GachaService.AddGachaResult(context, account, _mapper, GachaService.GetRandomCharacterId(rCharacterList), gachaList, itemList);
+        }
+
+        if (characterBanner.RecruitCoinId > 0)
+        {
+            var recruitCoinItem = context.Items.FirstOrDefault(x => x.AccountServerId == account.ServerId && x.UniqueId == characterBanner.RecruitCoinId);
+            if (recruitCoinItem != null)
+            {
+                recruitCoinItem.StackCount += gachaAmount;
+            }
+            else
+            {
+                context.Items.Add(new ItemDBServer
+                {
+                    AccountServerId = account.ServerId,
+                    UniqueId = characterBanner.RecruitCoinId,
+                    StackCount = gachaAmount
+                });
+                await context.SaveChangesAsync();
+                recruitCoinItem = context.Items.FirstOrDefault(x => x.AccountServerId == account.ServerId && x.UniqueId == characterBanner.RecruitCoinId);
+            }
+
+            if (recruitCoinItem != null)
+            {
+                var existingCoin = itemList.FirstOrDefault(x => x.UniqueId == characterBanner.RecruitCoinId);
+                if (existingCoin != null)
+                {
+                    existingCoin.StackCount = recruitCoinItem.StackCount;
+                }
+                else
+                {
+                    itemList.Add(recruitCoinItem);
+                }
+            }
+        }
+
+        return (itemList, gachaList);
+    }
+
+    // Audit_GachaStatistics: the client asks for a simulated run against a banner and renders the tally. Same ladder as CreateTenGacha minus the grants and the GUI cheat hooks - nothing here touches the account.
+    public Dictionary<long, long> SimulateGacha(long shopUniqueId, long count)
+    {
+        var dateTime = DateTime.Now;
+
+        var ssrCharacterList = _sharedDataCacheService.CharaListSSRNormal;
+        var srCharacterList = _sharedDataCacheService.CharaListSRNormal;
+        var rCharacterList = _sharedDataCacheService.CharaListRNormal;
+        var uniqCharacterList = _sharedDataCacheService.CharaListUnique;
+        var festCharacterList = _sharedDataCacheService.CharaListFest;
+
+        var characterBanner = _shopRecruitmentExcels.FirstOrDefault(x => x.Id == shopUniqueId)
+            ?? _shopRecruitmentExcels.First(x => x.CategoryType == ShopCategoryType.NormalGacha);
+
+        var rateUpChar = new CharacterExcelT();
+        var otherRateUpList = new List<CharacterExcelT>();
+
+        if (characterBanner.CategoryType != ShopCategoryType.NormalGacha)
+        {
+            var rateUpPickUp = _pickupDuplicateBonusExcels.GetPickupDuplicateBonusByShopId(characterBanner.Id);
+            rateUpChar = _characterExcels.GetCharacter(rateUpPickUp.PickupCharacterId);
+            var otherShopRecruitChars = _shopRecruitmentExcels
+                .GetAssignedCharacterIdShopRecruit().GetAssignedSaleShopRecruit()
+                .GetCategorizedShopRecruit(rateUpPickUp.ShopCategoryType).GetTimelinedShopRecruit(dateTime);
+            var characterIds = otherShopRecruitChars.SelectMany(x => x.InfoCharacterId);
+            foreach (long characterId in characterIds)
+            {
+                if (characterId == rateUpChar.Id) continue;
+                var character = _characterExcels.GetCharacter(characterId);
+                if (character != null) otherRateUpList.Add(character);
+            }
+        }
+
+        List<ShopCategoryType> allowedGachaTypes =
+        [
+            ShopCategoryType.PickupGacha,
+            ShopCategoryType.LimitedGacha
+        ];
+        const int guaranteedSRIndex = 9;
+        var (rateUpSSRRate, fesSSRRate, limitedSSRRate, permanentSSRRate, SRRate, isSelector) = GachaService.InitializeGachaRates(characterBanner.CategoryType);
+
+        // the client only ever asks for the odds-screen sizes; a hand-rolled request shouldn't be able to spin this loop forever
+        if (count > 100000) count = 100000;
+
+        var result = new Dictionary<long, long>();
+        void Tally(CharacterExcelT character)
+        {
+            result.TryGetValue(character.Id, out var n);
+            result[character.Id] = n + 1;
+        }
+
+        for (long i = 0; i < count; i++)
+        {
+            var randomNumber = Random.Shared.NextInt64(1000);
+
+            if (randomNumber < rateUpSSRRate && !characterBanner.CategoryType.Equals(ShopCategoryType.NormalGacha))
+            {
+                Tally(rateUpChar);
+            }
+            else if (randomNumber < rateUpSSRRate && allowedGachaTypes.Contains(characterBanner.CategoryType))
+            {
+                var currentFestCharacterList = festCharacterList.Concat(otherRateUpList).DistinctBy(x => x.Id).ToList();
+                Tally(GachaService.GetRandomCharacterId(currentFestCharacterList));
+            }
+            else if (randomNumber < fesSSRRate && characterBanner.CategoryType.Equals(ShopCategoryType.FesGacha))
+            {
+                var currentFestCharacterList = festCharacterList.Concat(otherRateUpList).DistinctBy(x => x.Id).ToList();
+                Tally(GachaService.GetRandomCharacterId(currentFestCharacterList));
+            }
+            else if (randomNumber < limitedSSRRate && limitedSSRRate > 0)
+            {
+                var currentUniqCharacterList = uniqCharacterList.Concat(otherRateUpList).DistinctBy(x => x.Id).ToList();
+                Tally(GachaService.GetRandomCharacterId(currentUniqCharacterList));
+            }
+            else if (randomNumber < permanentSSRRate)
+            {
+                Tally(GachaService.GetRandomCharacterId(ssrCharacterList, rateUpChar.Id, true));
+            }
+            else if (randomNumber < SRRate || i % 10 == guaranteedSRIndex)
+                Tally(GachaService.GetRandomCharacterId(srCharacterList));
+            else
+                Tally(GachaService.GetRandomCharacterId(rCharacterList));
+        }
+
+        return result;
+    }
+
+    public async Task<List<ShopInfoDB>> GetShopList(
+        SchaleDataContext context,
+        AccountDBServer account,
+        List<ShopExcelT> shopExcel,
+        List<ShopCategoryType> reqCategoryList)
+    {
+        var dateTime = account.GameSettings.ServerDateTime();
+        var purchases = context.GetAccountShopPurchases(account.ServerId).ToList();
+
+        List<ShopInfoDB> CategoryList = [];
+        foreach (ShopCategoryType shopCategoryType in reqCategoryList)
+        {
+            var ShopProductList = new List<ShopProductDB>();
+            var nonSaleProduct = shopExcel.GetNonSaleShopExcel();
+            var saleProduct = shopExcel.GetAssignedSaleShopExcel().GetTimelinedShopExcel(dateTime);
+            var combinedProduct = nonSaleProduct.Concat(saleProduct).DistinctBy(x => x.Id).ToList();
+            var products = combinedProduct.GetCategorizedShopExcel(shopCategoryType).ToList();
+
+            foreach (var product in products)
+            {
+                // Purchases made in an expired reset window don't count towards the current one.
+                var history = purchases.FirstOrDefault(x => x.ShopUniqueId == product.Id);
+                var purchased = history != null
+                    && history.PeriodStart == PeriodStart(product.PurchaseCountResetType, dateTime)
+                        ? history.PurchaseCount
+                        : 0;
+
+                ShopProductList.Add(new ShopProductDB
+                {
+                    ShopExcelId = product.Id,
+                    Category = product.CategoryType,
+                    DisplayOrder = product.DisplayOrder,
+                    PurchaseCount = purchased,
+                    SoldOut = product.PurchaseCountLimit > 0 && purchased >= product.PurchaseCountLimit,
+                    PurchaseCountLimit = product.PurchaseCountLimit,
+                    ProductType = ShopProductType.General
+                    // No Price: across 876 products in the official Shop_List captures the key appears exactly once, and that one response came from our own local server.
+                });
+            }
+
+            if (ShopProductList.Count != 0)
+            {
+                CategoryList.Add(new ShopInfoDB
+                {
+                    Category = shopCategoryType,
+                    ShopProductList = ShopProductList
+                });
+            }
+        }
+
+        return CategoryList;
+    }
+
+    /// <summary>
+    /// Loads (or creates) the account's purchase counter for a shop, rolls it over if its reset window has passed, and rejects the purchase when it would exceed the shop's PurchaseCountLimit.
+    /// Returns the tracked row so the caller can increment it after the consume/reward succeeds.
+    /// The row is added to the context but not saved - the caller's SaveChangesAsync commits the counter together with the parcels it paid for.
+    /// </summary>
+    public static async Task<ShopPurchaseHistoryDBServer> EnsurePurchasable(
+        SchaleDataContext context,
+        AccountDBServer account,
+        long shopUniqueId,
+        ShopExcelT shopExcel,
+        long purchaseCount)
+    {
+        var periodStart = PeriodStart(shopExcel.PurchaseCountResetType, account.GameSettings.ServerDateTime());
+
+        var history = await context.ShopPurchaseHistories
+            .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.ShopUniqueId == shopUniqueId);
+
+        if (history == null)
+        {
+            history = new ShopPurchaseHistoryDBServer
+            {
+                AccountServerId = account.ServerId,
+                ShopUniqueId = shopUniqueId,
+                PurchaseCount = 0,
+                PeriodStart = periodStart
+            };
+            context.ShopPurchaseHistories.Add(history);
+        }
+        else if (history.PeriodStart != periodStart)
+        {
+            history.PurchaseCount = 0;
+            history.PeriodStart = periodStart;
+        }
+
+        if (shopExcel.PurchaseCountLimit > 0
+            && history.PurchaseCount + purchaseCount > shopExcel.PurchaseCountLimit)
+        {
+            throw new WebAPIException(WebAPIErrorCode.ShopExceedPurchaseCountLimit,
+                $"Shop {shopUniqueId}: {history.PurchaseCount} + {purchaseCount} exceeds limit {shopExcel.PurchaseCountLimit}");
+        }
+
+        return history;
+    }
+
+    /// <summary>
+    /// Start of the reset window a purchase falls into. The game day rolls over at 04:00, so a purchase at 02:00 belongs to the previous calendar day's window. Weeks start Monday.
+    /// </summary>
+    internal static DateTime PeriodStart(PurchaseCountResetType resetType, DateTime now)
+    {
+        if (resetType == PurchaseCountResetType.None)
+            return DateTime.MinValue;
+
+        var gameDay = (now.TimeOfDay < TimeSpan.FromHours(4) ? now.AddDays(-1) : now).Date;
+
+        return resetType switch
+        {
+            PurchaseCountResetType.Day => gameDay,
+            PurchaseCountResetType.Week => gameDay.AddDays(-(((int)gameDay.DayOfWeek + 6) % 7)),
+            PurchaseCountResetType.Month => new DateTime(gameDay.Year, gameDay.Month, 1),
+            _ => DateTime.MinValue
+        };
+    }
+}

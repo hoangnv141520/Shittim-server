@@ -1,0 +1,94 @@
+using Microsoft.AspNetCore.Mvc;
+using Schale.MX.NetworkProtocol;
+using Newtonsoft.Json;
+using System.Text;
+using Shittim_Server.Core;
+
+namespace Shittim_Server.Controllers.SDK
+{
+    [ApiController]
+    [Route("/")]
+    public class PublicApiController : ControllerBase
+    {
+        private readonly HandlerManager _handlerManager;
+        private readonly ILogger<PublicApiController> _logger;
+
+        public PublicApiController(HandlerManager handlerManager, ILogger<PublicApiController> logger)
+        {
+            _handlerManager = handlerManager;
+            _logger = logger;
+        }
+
+        [HttpPost("gameclient/log")]
+        public async Task<IResult> GameClientLog()
+        {
+            try
+            {
+                using var reader = new StreamReader(Request.Body, Encoding.UTF8, leaveOpen: true);
+                var payload = await reader.ReadToEndAsync();
+                if (!string.IsNullOrWhiteSpace(payload))
+                {
+                    _logger.LogWarning("[GameClientLog] {Payload}", payload);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to read gameclient/log payload");
+            }
+
+            return Results.Json(new { code = 0 });
+        }
+
+        [HttpPost("gameclient/auth")]
+        public async Task<IActionResult> Auth([FromBody] AccountAuthRequest request)
+        {
+            try
+            {
+                if (!_handlerManager.IsImplemented(Protocol.Account_Auth))
+                {
+                    _logger.LogError("Account_Auth handler not found");
+                    return StatusCode(500, new { error = "Handler not found" });
+                }
+
+                var response = await _handlerManager.Dispatch(Protocol.Account_Auth, request);
+                if (response == null)
+                {
+                    return StatusCode(500, new { error = "Handler returned null" });
+                }
+
+                return Ok(response);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in Account_Auth");
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        [HttpPost("gameclient/create")]
+        public async Task<IActionResult> Create([FromBody] AccountCreateRequest request)
+        {
+            try
+            {
+                if (!_handlerManager.IsImplemented(Protocol.Account_Create))
+                {
+                    _logger.LogError("Account_Create handler not found");
+                    return StatusCode(500, new { error = "Handler not found" });
+                }
+
+                var response = await _handlerManager.Dispatch(Protocol.Account_Create, request);
+                if (response == null)
+                {
+                    return StatusCode(500, new { error = "Handler returned null" });
+                }
+
+                return Ok(response);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in Account_Create");
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+    }
+}
