@@ -44,6 +44,7 @@ public class MissionHandler : ProtocolHandlerBase
         MissionSyncResponse response)
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        await ReconcileClaimMissionProgress(db, account);
 
         var missionProgresses = db.GetAccountMissionProgresses(account.ServerId).ToList();
 
@@ -60,6 +61,7 @@ public class MissionHandler : ProtocolHandlerBase
         MissionListResponse response)
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        await ReconcileClaimMissionProgress(db, account);
 
         // Official's MissionHistoryUniqueIds carries claimed-mission ids only - never campaign stage data. In the 2026-07-28 capture pair the account-wide list is every claim once, plus a second copy of exactly the claims whose id is NOT in MissionExcel (its 78 guide-mission claims, ids 1000200-1000375 in GuideMissionExcel's range), and the event-scoped list is exactly that non-MissionExcel subset.
         // An id the client cannot resolve against an excel kills the mission screen outright - it renders from this login-cached response without any further request, so nothing loads and no error reaches the wire.
@@ -278,6 +280,7 @@ public class MissionHandler : ProtocolHandlerBase
         MissionRewardResponse response)
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        await ReconcileClaimMissionProgress(db, account);
 
         var missionProgress = await db.MissionProgresses
             .FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId && x.MissionUniqueId == request.MissionUniqueId);
@@ -297,6 +300,22 @@ public class MissionHandler : ProtocolHandlerBase
 
         // An unknown id falling through with a null excel would still delete the progress row and write a history entry while skipping the reward, leaving the mission permanently unclaimable.
         var missionExcel = _excelService.GetTable<MissionExcelT>().FirstOrDefault(x => x.Id == request.MissionUniqueId)
+            ?? _excelService.GetTable<GuideMissionExcelT>().Where(x => x.Id == request.MissionUniqueId).Select(x => new MissionExcelT
+            {
+                Id = x.Id,
+                Category = x.Category,
+                MissionRewardParcelType = x.MissionRewardParcelType,
+                MissionRewardParcelId = x.MissionRewardParcelId,
+                MissionRewardAmount = x.MissionRewardAmount
+            }).FirstOrDefault()
+            ?? _excelService.GetTable<EventContentMissionExcelT>().Where(x => x.Id == request.MissionUniqueId).Select(x => new MissionExcelT
+            {
+                Id = x.Id,
+                Category = x.Category,
+                MissionRewardParcelType = x.MissionRewardParcelType,
+                MissionRewardParcelId = x.MissionRewardParcelId,
+                MissionRewardAmount = x.MissionRewardAmount
+            }).FirstOrDefault()
             ?? throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound,
                 $"Mission excel {request.MissionUniqueId} not found");
 
@@ -333,17 +352,45 @@ public class MissionHandler : ProtocolHandlerBase
 
         await db.SaveChangesAsync();
 
-        if (missionExcel.Category == MissionCategory.Daily)
+        var updatedProgresses = new List<MissionProgressDB>();
+
+        if (missionExcel.Category is MissionCategory.Daily or MissionCategory.DailySudden)
         {
-            var updatedMetaMissions = _missionService.UpdateMissionProgress(
+            var metaDaily = _missionService.UpdateMissionProgress(
                 db, 
                 account, 
                 MissionCompleteConditionType.Reset_DailyMissionFulfill, 
                 1
             );
-            
-            // so the client sees the meta-mission progress bar move
-            response.MissionProgressDBs = updatedMetaMissions;
+            updatedProgresses.AddRange(metaDaily);
+
+            var completeDaily = _missionService.UpdateMissionProgress(
+                db,
+                account,
+                MissionCompleteConditionType.Reset_CompleteMission,
+                1,
+                missionProgress.MissionUniqueId
+            );
+            updatedProgresses.AddRange(completeDaily);
+        }
+        else if (missionExcel.Category is MissionCategory.Weekly)
+        {
+            var completeWeekly = _missionService.UpdateMissionProgress(
+                db,
+                account,
+                MissionCompleteConditionType.Reset_CompleteMission,
+                1,
+                missionProgress.MissionUniqueId
+            );
+            updatedProgresses.AddRange(completeWeekly);
+        }
+
+        if (updatedProgresses.Count > 0)
+        {
+            response.MissionProgressDBs = updatedProgresses
+                .GroupBy(x => x.MissionUniqueId)
+                .Select(g => g.Last())
+                .ToList();
             await db.SaveChangesAsync();
         }
         else
@@ -361,6 +408,7 @@ public class MissionHandler : ProtocolHandlerBase
         MissionMultipleRewardResponse response)
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        await ReconcileClaimMissionProgress(db, account);
 
         // Event missions live in their own table keyed by event; MissionExcel holds not one row in any event category, so nothing an id prefix picks out of it belongs to an event tab.
         var missionExcels = request.EventContentId.GetValueOrDefault() == 0
@@ -383,10 +431,12 @@ public class MissionHandler : ProtocolHandlerBase
             .ToList();
 
         // MissionCategory.All is the client's "claim everything" tab value; no excel row ever carries it, so it must bypass the category filter rather than match against it.
+        // On the Daily tab, the client renders Daily, DailySudden, and DailyFixed missions together.
         var targetProgresses = progresses
             .Where(p => missionExcelById.TryGetValue(p.MissionUniqueId, out var missionExcel)
                 && (request.MissionCategory == MissionCategory.All
-                    || missionExcel.Category == request.MissionCategory))
+                    || missionExcel.Category == request.MissionCategory
+                    || (request.MissionCategory == MissionCategory.Daily && (missionExcel.Category is MissionCategory.DailySudden or MissionCategory.DailyFixed))))
             .ToList();
 
         if (targetProgresses.Count == 0)
@@ -440,26 +490,70 @@ public class MissionHandler : ProtocolHandlerBase
 
         response.AddedHistoryDBs = addedHistory;
 
-        // Count only the rows that actually were Daily missions (with the All tab, the batch can span every category).
-        var claimedDailyCount = targetProgresses.Count(p =>
-            missionExcelById.TryGetValue(p.MissionUniqueId, out var excel)
-            && excel.Category == MissionCategory.Daily);
+        var claimedDaily = targetProgresses
+            .Where(p => missionExcelById.TryGetValue(p.MissionUniqueId, out var excel)
+                && (excel.Category is MissionCategory.Daily or MissionCategory.DailySudden))
+            .ToList();
 
-        if (claimedDailyCount > 0)
+        var updatedMissions = new List<MissionProgressDB>();
+
+        if (claimedDaily.Count > 0)
         {
-            var updatedMetaMissions = _missionService.UpdateMissionProgress(
+            var metaDaily = _missionService.UpdateMissionProgress(
                 db,
                 account,
                 MissionCompleteConditionType.Reset_DailyMissionFulfill,
-                claimedDailyCount);
+                claimedDaily.Count);
+            updatedMissions.AddRange(metaDaily);
 
-            if (updatedMetaMissions.Count > 0)
-                response.MissionProgressDBs = updatedMetaMissions;
+            foreach (var p in claimedDaily)
+            {
+                var comp = _missionService.UpdateMissionProgress(
+                    db,
+                    account,
+                    MissionCompleteConditionType.Reset_CompleteMission,
+                    1,
+                    p.MissionUniqueId);
+                updatedMissions.AddRange(comp);
+            }
+        }
+
+        var claimedWeekly = targetProgresses
+            .Where(p => missionExcelById.TryGetValue(p.MissionUniqueId, out var excel)
+                && excel.Category == MissionCategory.Weekly)
+            .ToList();
+
+        if (claimedWeekly.Count > 0)
+        {
+            foreach (var p in claimedWeekly)
+            {
+                var comp = _missionService.UpdateMissionProgress(
+                    db,
+                    account,
+                    MissionCompleteConditionType.Reset_CompleteMission,
+                    1,
+                    p.MissionUniqueId);
+                updatedMissions.AddRange(comp);
+            }
+        }
+
+        if (updatedMissions.Count > 0)
+        {
+            response.MissionProgressDBs = updatedMissions
+                .GroupBy(x => x.MissionUniqueId)
+                .Select(g => g.Last())
+                .ToList();
         }
 
         await db.SaveChangesAsync();
 
         return response;
+    }
+
+    private async Task ReconcileClaimMissionProgress(SchaleDataContext db, AccountDBServer account)
+    {
+        if (_missionService.ReconcileClaimMissionProgress(db, account))
+            await db.SaveChangesAsync();
     }
 
     [ProtocolHandler(Protocol.Mission_GuideReward)]

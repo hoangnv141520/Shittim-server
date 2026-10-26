@@ -45,7 +45,10 @@ public class EventContentCampaignHandler : ProtocolHandlerBase
         var strategyHistories = db.GetAccountStrategyObjectHistories(account.ServerId).ToList();
 
         response.StrategyObjecthistoryDBs = _mapper.Map<List<StrategyObjectHistoryDB>>(strategyHistories);
-        response.AlreadyReceiveRewardId = [];
+        // Reopening the event must preserve the stage-total rewards already claimed by
+        // ReceiveStageTotalReward instead of reporting an empty claim history.
+        response.AlreadyReceiveRewardId = account.ContentInfo.ReceivedEventStageTotalRewards?
+            .GetValueOrDefault(request.EventContentId)?.ToList() ?? [];
         response.EventContentBonusRewardDBs = [];
 
         return response;

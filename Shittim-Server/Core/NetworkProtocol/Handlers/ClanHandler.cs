@@ -235,10 +235,9 @@ public class ClanHandler : ProtocolHandlerBase
         ClanMyAssistListRequest request,
         ClanMyAssistListResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        // "which of my characters am I lending out" - legitimately empty on a solo server, but the list itself must be present or the client faults on it.
-        response.ClanAssistSlotDBs = [];
+        response.ClanAssistSlotDBs = account.ContentInfo.ClanAssistSlots ?? [];
 
         return response;
     }
@@ -251,6 +250,26 @@ public class ClanHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
+        // CharacterDBId is an owned roster row, not the character's Excel id.
+        if (request.CharacterDBId != 0 && !await db.Characters.AnyAsync(x =>
+            x.AccountServerId == account.ServerId && x.ServerId == request.CharacterDBId))
+            throw new WebAPIException(WebAPIErrorCode.CharacterNotFound);
+
+        var slots = account.ContentInfo.ClanAssistSlots ??= [];
+        var previous = slots.FirstOrDefault(x => x.EchelonType == request.EchelonType
+            && x.SlotNumber == request.SlotNumber);
+        if (request.CharacterDBId != 0 && slots.Any(x => x != previous
+            && x.EchelonType == request.EchelonType && x.CharacterDBId == request.CharacterDBId))
+            throw new WebAPIException(WebAPIErrorCode.ClanAssistCharacterAlreadyDeployed);
+
+        // Repeating the same assignment must not reset its deployment clock.
+        if (previous != null && previous.CharacterDBId == request.CharacterDBId
+            && previous.CombatStyleIndex == request.CombatStyleIndex)
+        {
+            response.ClanAssistSlotDB = previous;
+            return response;
+        }
+
         response.ClanAssistSlotDB = new ClanAssistSlotDB
         {
             EchelonType = request.EchelonType,
@@ -259,6 +278,13 @@ public class ClanHandler : ProtocolHandlerBase
             CombatStyleIndex = request.CombatStyleIndex,
             DeployDate = account.GameSettings.ServerDateTime()
         };
+
+        if (previous != null)
+            slots.Remove(previous);
+        if (request.CharacterDBId != 0)
+            slots.Add(response.ClanAssistSlotDB);
+        db.Entry(account).Property(x => x.ContentInfo).IsModified = true;
+        await db.SaveChangesAsync();
 
         return response;
     }
@@ -307,7 +333,7 @@ public class ClanHandler : ProtocolHandlerBase
             JoinDate = account.CreateDate
         };
 
-        response.ClanAssistSlotDBs = [];
+        response.ClanAssistSlotDBs = account.ContentInfo.ClanAssistSlots ?? [];
 
         return response;
     }

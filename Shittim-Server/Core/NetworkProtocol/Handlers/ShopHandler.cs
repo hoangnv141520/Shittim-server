@@ -268,7 +268,7 @@ public class ShopHandler : ProtocolHandlerBase
             response.GachaResults = results;
             response.AcquiredItems = acquired;
             response.UpdateTime = account.GameSettings.ServerDateTime();
-            response.PickupFirstGetHistoryDBs = [];
+            response.PickupFirstGetHistoryDBs = ResolvePickupFirstGetHistories(account, request.ShopUniqueId, results);
             response.ServerTimeTicks = account.GameSettings.ServerDateTimeTicks();
 
             await db.SaveChangesAsync();
@@ -304,7 +304,7 @@ public class ShopHandler : ProtocolHandlerBase
             recruitHistory.LastUpdateDate = DateTime.UtcNow;
         }
 
-        response.PickupFirstGetHistoryDBs = [];
+        response.PickupFirstGetHistoryDBs = ResolvePickupFirstGetHistories(account, request.ShopUniqueId, gachaResults);
 
         var updatedMissions = _missionService.UpdateMissionProgress(
             db, 
@@ -320,7 +320,34 @@ public class ShopHandler : ProtocolHandlerBase
         return response;
     }
 
-
+    private List<PickupFirstGetHistoryDB> ResolvePickupFirstGetHistories(
+        AccountDBServer account,
+        long shopUniqueId,
+        IEnumerable<GachaResult> gachaResults)
+    {
+        var pickupFirstGets = new List<PickupFirstGetHistoryDB>();
+        var recruitShop = _excelService.GetTable<ShopRecruitExcelT>().FirstOrDefault(x => x.Id == shopUniqueId);
+        if (recruitShop != null && recruitShop.CategoryType != ShopCategoryType.NormalGacha && recruitShop.InfoCharacterId != null)
+        {
+            account.ContentInfo.PickupFirstGetHistories ??= [];
+            bool alreadyGot = account.ContentInfo.PickupFirstGetHistories.Any(h => h.ShopRecruitId == shopUniqueId);
+            if (!alreadyGot)
+            {
+                bool gotPickupChar = gachaResults.Any(r => r.Character != null && recruitShop.InfoCharacterId.Contains(r.Character.UniqueId));
+                if (gotPickupChar)
+                {
+                    var entry = new PickupFirstGetHistoryDB
+                    {
+                        ShopRecruitId = shopUniqueId,
+                        LogDate = account.GameSettings.ServerDateTime()
+                    };
+                    account.ContentInfo.PickupFirstGetHistories.Add(entry);
+                    pickupFirstGets.Add(entry);
+                }
+            }
+        }
+        return pickupFirstGets;
+    }
 
     [ProtocolHandler(Protocol.Shop_PickupSelectionGachaGet)]
     public async Task<ShopPickupSelectionGachaGetResponse> PickupSelectionGachaGet(

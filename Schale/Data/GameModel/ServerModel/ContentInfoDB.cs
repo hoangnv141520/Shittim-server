@@ -19,7 +19,10 @@ namespace Schale.Data.GameModel
         public List<CraftPresetSlotDB> CraftPresets { get; set; } = [];
         public List<ShiftingCraftInfoDB> ShiftingCrafts { get; set; } = [];
         public FriendIdCardDB IdCard { get; set; } = new();
+        public FriendDataInfo Friends { get; set; } = new();
         public List<FieldSnapshot> FieldSeasons { get; set; } = [];
+        public List<PickupFirstGetHistoryDB> PickupFirstGetHistories { get; set; } = [];
+        public List<ClanAssistSlotDB> ClanAssistSlots { get; set; } = [];
     }
 
     public class RaidDataInfo

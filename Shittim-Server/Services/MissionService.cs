@@ -20,6 +20,101 @@ public class MissionService
         _mapper = mapper;
     }
 
+    // Older builds never advanced some claim-count missions, or split their counts by candidate
+    // id. Rebuild only these counters from actual rewarded missions; action missions still require
+    // their normal gameplay event. This also repairs an already-running account without replaying
+    // its dailies or waiting for tomorrow.
+    public bool ReconcileClaimMissionProgress(SchaleDataContext context, AccountDBServer account)
+    {
+        var missions = _excelService.GetTable<MissionExcelT>();
+        var counters = missions.Where(m =>
+            (m.Category is MissionCategory.Daily or MissionCategory.DailyFixed or MissionCategory.Weekly)
+            && (m.CompleteConditionType is MissionCompleteConditionType.Reset_CompleteMission
+                or MissionCompleteConditionType.Reset_DailyMissionFulfill)).ToList();
+        if (counters.Count == 0)
+            return false;
+
+        var now = account.GameSettings.ServerDateTime();
+        var dayStart = (now.TimeOfDay < TimeSpan.FromHours(4) ? now.AddDays(-1) : now).Date.AddHours(4);
+        var weekStart = dayStart.AddDays(-(((int)dayStart.DayOfWeek + 6) % 7));
+        var lastClaims = context.MissionHistories
+            .Where(h => h.AccountServerId == account.ServerId)
+            .Select(h => new { h.MissionUniqueId, h.CompleteTime })
+            .AsEnumerable()
+            .Concat(context.MissionHistories.Local.Where(h => h.AccountServerId == account.ServerId)
+                .Select(h => new { h.MissionUniqueId, h.CompleteTime }))
+            .GroupBy(h => h.MissionUniqueId)
+            .ToDictionary(g => g.Key, g => g.Max(h => h.CompleteTime));
+        var dailyIds = missions.Where(m => m.Category is MissionCategory.Daily or MissionCategory.DailySudden)
+            .Select(m => m.Id).ToHashSet();
+        var changed = false;
+
+        foreach (var mission in counters)
+        {
+            var windowStart = mission.ResetType switch
+            {
+                MissionResetType.Daily => dayStart,
+                MissionResetType.Weekly => weekStart,
+                _ => DateTime.MinValue
+            };
+            var progress = context.MissionProgresses.Local.FirstOrDefault(p =>
+                p.AccountServerId == account.ServerId && p.MissionUniqueId == mission.Id)
+                ?? context.MissionProgresses.FirstOrDefault(p =>
+                    p.AccountServerId == account.ServerId && p.MissionUniqueId == mission.Id);
+            // Old claim-all could recreate even an already-rewarded counter. Remove that stale
+            // progress as well, so a later direct reward cannot pay the same counter twice.
+            if (lastClaims.TryGetValue(mission.Id, out var claimedAt) && claimedAt >= windowStart)
+            {
+                if (progress != null)
+                {
+                    context.MissionProgresses.Remove(progress);
+                    changed = true;
+                }
+                continue;
+            }
+            var count = lastClaims.Count(h => h.Value >= windowStart &&
+                (mission.CompleteConditionType == MissionCompleteConditionType.Reset_DailyMissionFulfill
+                    ? dailyIds.Contains(h.Key)
+                    : mission.CompleteConditionParameter is { Count: > 0 }
+                        && mission.CompleteConditionParameter.Contains(h.Key)));
+            if (count == 0)
+                continue;
+
+            // Preserve completed but unclaimed missions even if old history is unavailable.
+            if (progress?.Complete == true)
+                continue;
+            if (progress == null)
+            {
+                progress = new MissionProgressDBServer
+                {
+                    AccountServerId = account.ServerId,
+                    MissionUniqueId = mission.Id,
+                    StartTime = now,
+                    ProgressParameters = new Dictionary<long, long>()
+                };
+                context.MissionProgresses.Add(progress);
+            }
+
+            var key = mission.CompleteConditionType == MissionCompleteConditionType.Reset_CompleteMission
+                && mission.CompleteConditionParameter is { Count: 1 }
+                    ? mission.CompleteConditionParameter[0] : 0L;
+            progress.ProgressParameters ??= new Dictionary<long, long>();
+            var repairedCount = Math.Max(progress.ProgressParameters.GetValueOrDefault(key), count);
+            if (progress.ProgressParameters.GetValueOrDefault(key) != repairedCount
+                || (progress.ProgressParameters.Count != 1 && key == 0))
+            {
+                progress.ProgressParameters = new Dictionary<long, long> { [key] = repairedCount };
+                changed = true;
+            }
+            if (repairedCount >= mission.CompleteConditionCount)
+            {
+                progress.Complete = true;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     public List<MissionProgressDB> UpdateMissionProgress(
         SchaleDataContext context,
         AccountDBServer account,
@@ -34,11 +129,13 @@ public class MissionService
         var relevantMissions = missionExcels
             .Where(m => m.CompleteConditionType == conditionType)
             .Where(m => m.Category == MissionCategory.Daily ||
+                       m.Category == MissionCategory.DailySudden ||
+                       m.Category == MissionCategory.DailyFixed ||
                        m.Category == MissionCategory.Weekly ||
                        m.Category == MissionCategory.Achievement ||
                        // Challenge is the per-stage "clear it in N turns" mission. Official sends these in MissionProgressDBs like any other (30150 on the campaign clear), and Mission_List serves them from the same storage. Every Reset_CompleteCampaignStageMinimumTurn row is Challenge.
                        m.Category == MissionCategory.Challenge)
-            .Select(m => new { m.Id, m.CompleteConditionParameter, m.CompleteConditionCount, IsBattlePass = false })
+            .Select(m => new { m.Id, m.CompleteConditionParameter, m.CompleteConditionCount, m.ResetType, IsBattlePass = false })
             .ToList();
 
         // BattlePass missions share the MissionProgresses storage (BattlePass_MissionList serves them from it), but they must never reach the returned list: handlers attach it to client responses as MissionProgressDBs,
@@ -46,15 +143,40 @@ public class MissionService
         // Progress is still persisted for both kinds below.
         var relevantBpMissions = battlePassMissionExcels
             .Where(m => m.CompleteConditionType == conditionType)
-            .Select(m => new { m.Id, m.CompleteConditionParameter, m.CompleteConditionCount, IsBattlePass = true })
+            .Select(m => new { m.Id, m.CompleteConditionParameter, m.CompleteConditionCount, m.ResetType, IsBattlePass = true })
             .ToList();
 
         relevantMissions.AddRange(relevantBpMissions);
 
         var lowerIsBetter = IsLowerBetter(conditionType);
+        var now = account.GameSettings.ServerDateTime();
+        var dayStart = (now.TimeOfDay < TimeSpan.FromHours(4) ? now.AddDays(-1) : now).Date.AddHours(4);
+        var weekStart = dayStart.AddDays(-(((int)dayStart.DayOfWeek + 6) % 7));
+        var missionIds = relevantMissions.Where(m => !m.IsBattlePass).Select(m => m.Id).ToList();
+        // BuildParcel can save deleted progress rows before the reward handler advances meta missions.
+        // Include both saved and pending claims so that advancing another daily cannot recreate a
+        // mission already rewarded in this window (especially DailyFixed 1701 in claim-all).
+        var lastClaims = context.MissionHistories
+            .Where(h => h.AccountServerId == account.ServerId && missionIds.Contains(h.MissionUniqueId))
+            .Select(h => new { h.MissionUniqueId, h.CompleteTime })
+            .AsEnumerable()
+            .Concat(context.MissionHistories.Local
+                .Where(h => h.AccountServerId == account.ServerId && missionIds.Contains(h.MissionUniqueId))
+                .Select(h => new { h.MissionUniqueId, h.CompleteTime }))
+            .GroupBy(h => h.MissionUniqueId)
+            .ToDictionary(g => g.Key, g => g.Max(h => h.CompleteTime));
 
         foreach (var mission in relevantMissions)
         {
+            if (!mission.IsBattlePass && lastClaims.TryGetValue(mission.Id, out var lastClaim)
+                && (mission.ResetType switch
+                {
+                    MissionResetType.Daily => lastClaim >= dayStart,
+                    MissionResetType.Weekly => lastClaim >= weekStart,
+                    _ => true
+                }))
+                continue;
+
             // A mission that names its subject only moves for that subject.
             // Letting a caller with no parameter tick every parameterised row of the condition type means one campaign clear satisfies all 259 "clear stage X" missions at once.
             var declared = mission.CompleteConditionParameter;
@@ -62,13 +184,18 @@ public class MissionService
             if (hasDeclared && (!parameter.HasValue || !declared!.Contains(parameter.Value)))
                 continue;
 
-            // Official keys ProgressParameters by the parameter the mission matched on, not by 0: its campaign clear reports {"1161101": 1} for the stage-specific mission and {"0": 16} for the ones with no parameter.
-            // The client reads the count out by that key.
-            var key = hasDeclared ? parameter!.Value : 0L;
+            // When a mission requires completing N missions from a list of candidate mission IDs (e.g. Reset_CompleteMission),
+            // parameter.Value is the specific mission just completed. The count is accumulated in bucket 0L rather than under parameter.Value,
+            // because no single candidate mission alone can or will reach the total required count.
+            var isMultiParameterCount = hasDeclared && declared!.Count > 1 &&
+                conditionType is MissionCompleteConditionType.Reset_CompleteMission;
 
-            var existingMission = context.MissionProgresses
-                .FirstOrDefault(m => m.AccountServerId == account.ServerId &&
-                                   m.MissionUniqueId == mission.Id);
+            var key = isMultiParameterCount ? 0L : (hasDeclared ? parameter!.Value : 0L);
+
+            var existingMission = context.MissionProgresses.Local
+                .FirstOrDefault(m => m.AccountServerId == account.ServerId && m.MissionUniqueId == mission.Id)
+                ?? context.MissionProgresses
+                    .FirstOrDefault(m => m.AccountServerId == account.ServerId && m.MissionUniqueId == mission.Id);
 
             if (existingMission != null && existingMission.Complete)
                 continue;

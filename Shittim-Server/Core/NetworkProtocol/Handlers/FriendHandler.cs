@@ -15,14 +15,109 @@ public class FriendHandler : ProtocolHandlerBase
 {
     private readonly ISessionKeyService _sessionService;
     private readonly IMapper _mapper;
+    private readonly ExcelTableService _excelService;
 
     public FriendHandler(
         IProtocolHandlerRegistry registry,
         ISessionKeyService sessionService,
-        IMapper mapper) : base(registry)
+        IMapper mapper,
+        ExcelTableService excelService) : base(registry)
     {
         _sessionService = sessionService;
         _mapper = mapper;
+        _excelService = excelService;
+    }
+
+    private FriendDB BuildFriend(SchaleDataContext db, AccountDBServer target)
+    {
+        var character = db.GetAccountCharacters(target.ServerId)
+            .FirstOrDefault(x => x.ServerId == target.RepresentCharacterServerId);
+        var attachment = db.GetAccountAttachments(target.ServerId).FirstOrDefault();
+        return new FriendDB
+        {
+            AccountId = target.ServerId,
+            Nickname = target.Nickname,
+            Level = target.Level,
+            RepresentCharacterUniqueId = character?.UniqueId ?? 0,
+            RepresentCharacterCostumeId = character == null ? 0 : db.GetAccountCostumes(target.ServerId)
+                .Where(x => x.BoundCharacterServerId == character.ServerId).Select(x => x.UniqueId).FirstOrDefault(),
+            LastConnectTime = target.LastConnectTime,
+            ComfortValue = db.GetAccountCafes(target.ServerId).FirstOrDefault(x => x.CafeId == 1)?.ProductionDB?.ComfortValue ?? 0,
+            FriendCount = target.ContentInfo.Friends.FriendAccountIds.Count,
+            AttachmentDB = attachment == null ? null : _mapper.Map<AccountAttachmentDB>(attachment)
+        };
+    }
+
+    private FriendIdCardDB BuildIdCard(SchaleDataContext db, AccountDBServer account)
+    {
+        var card = account.ContentInfo.IdCard;
+        card.Level = account.Level;
+        card.FriendCode = AccountHandler.BuildFriendCode(account.ServerId);
+        card.LastConnectTime = account.LastConnectTime;
+        if (card.RepresentCharacterUniqueId == 0)
+            card.RepresentCharacterUniqueId = BuildFriend(db, account).RepresentCharacterUniqueId;
+        return card;
+    }
+
+    private (FriendDB[] Friends, FriendDB[] Sent, FriendDB[] Received, FriendDB[] Blocked) GetLists(
+        SchaleDataContext db, AccountDBServer account)
+    {
+        var state = account.ContentInfo.Friends;
+        FriendDB[] Profiles(HashSet<long> ids) => db.Accounts.Where(x => ids.Contains(x.ServerId))
+            .ToList().Select(x => BuildFriend(db, x)).ToArray();
+        return (Profiles(state.FriendAccountIds), Profiles(state.SentRequestAccountIds),
+            Profiles(state.ReceivedRequestAccountIds), Profiles(state.BlockedAccountIds));
+    }
+
+    private static AccountDBServer GetTarget(SchaleDataContext db, AccountDBServer account, long targetId,
+        WebAPIErrorCode selfError)
+    {
+        if (targetId == account.ServerId)
+            throw new WebAPIException(selfError);
+        return db.Accounts.FirstOrDefault(x => x.ServerId == targetId)
+            ?? throw new WebAPIException(WebAPIErrorCode.FriendRequestNotFound);
+    }
+
+    private static bool IsBlocked(AccountDBServer account, AccountDBServer target) =>
+        account.ContentInfo.Friends.BlockedAccountIds.Contains(target.ServerId) ||
+        target.ContentInfo.Friends.BlockedAccountIds.Contains(account.ServerId);
+
+    private static void EnsureNotBlocked(AccountDBServer account, AccountDBServer target, WebAPIErrorCode error)
+    {
+        if (IsBlocked(account, target))
+            throw new WebAPIException(error);
+    }
+
+    private static void ClearRequests(AccountDBServer account, AccountDBServer target)
+    {
+        account.ContentInfo.Friends.SentRequestAccountIds.Remove(target.ServerId);
+        account.ContentInfo.Friends.ReceivedRequestAccountIds.Remove(target.ServerId);
+        target.ContentInfo.Friends.SentRequestAccountIds.Remove(account.ServerId);
+        target.ContentInfo.Friends.ReceivedRequestAccountIds.Remove(account.ServerId);
+    }
+
+    private static void Befriend(AccountDBServer account, AccountDBServer target)
+    {
+        ClearRequests(account, target);
+        account.ContentInfo.Friends.FriendAccountIds.Add(target.ServerId);
+        target.ContentInfo.Friends.FriendAccountIds.Add(account.ServerId);
+    }
+
+    private static async Task SavePair(SchaleDataContext db, AccountDBServer account, AccountDBServer target)
+    {
+        db.Entry(account).Property(x => x.ContentInfo).IsModified = true;
+        db.Entry(target).Property(x => x.ContentInfo).IsModified = true;
+        await db.SaveChangesAsync();
+    }
+
+    private void EnsureFriendCapacity(AccountDBServer account, AccountDBServer target, bool accepting)
+    {
+        var limit = _excelService.GetTable<ConstCommonExcelT>().First().MaxFriendsCount;
+        if (account.ContentInfo.Friends.FriendAccountIds.Count >= limit)
+            throw new WebAPIException(accepting ? WebAPIErrorCode.FriendCannotAcceptMaxFriendCountReached
+                : WebAPIErrorCode.FriendCannotRequestMaxFriendCountReached);
+        if (target.ContentInfo.Friends.FriendAccountIds.Count >= limit)
+            throw new WebAPIException(WebAPIErrorCode.FriendOpponentMaxFriendCountReached);
     }
 
     [ProtocolHandler(Protocol.Friend_Check)]
@@ -33,6 +128,8 @@ public class FriendHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
+        if (account.ContentInfo.Friends.ReceivedRequestAccountIds.Count > 0)
+            response.ServerNotification |= ServerNotificationFlag.HasFriendRequest;
         return response;
     }
 
@@ -44,9 +141,13 @@ public class FriendHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
+        response.FriendIdCardDB = BuildIdCard(db, account);
+        response.IdCardBackgroundDBs = db.GetAccountIdCardBackgrounds(account.ServerId).ToMapList(_mapper).ToArray();
 
         return response;
     }
@@ -67,27 +168,7 @@ public class FriendHandler : ProtocolHandlerBase
                 .Where(a => request.TargetAccountIds.Contains(a.ServerId))
                 .ToListAsync();
 
-            var friendDbs = new List<FriendDB>();
-
-            foreach (var targetAccount in targetAccounts)
-            {
-                var attachment = db.GetAccountAttachments(targetAccount.ServerId).FirstOrDefault();
-
-                friendDbs.Add(new FriendDB
-                {
-                    AccountId = targetAccount.ServerId,
-                    Nickname = targetAccount.Nickname ?? "Sensei",
-                    Level = targetAccount.Level,
-                    RepresentCharacterUniqueId = targetAccount.RepresentCharacterServerId,
-                    RepresentCharacterCostumeId = targetAccount.RepresentCharacterServerId,
-                    LastConnectTime = account.GameSettings.ServerDateTime(),
-                    ComfortValue = 10000,
-                    FriendCount = 0,
-                    AttachmentDB = attachment != null ? _mapper.Map<AccountAttachmentDB>(attachment) : null
-                });
-            }
-
-            response.ListResult = friendDbs.ToArray();
+            response.ListResult = targetAccounts.Select(target => BuildFriend(db, target)).ToArray();
         }
 
         return response;
@@ -100,8 +181,36 @@ public class FriendHandler : ProtocolHandlerBase
         FriendSendFriendRequestResponse response)
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
-        
-        throw new WebAPIException(WebAPIErrorCode.FriendRequestNotFound);
+
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendRequestTargetIsYourself);
+        EnsureNotBlocked(account, target, WebAPIErrorCode.FriendBlockUserCannotSendRequest);
+        var friends = account.ContentInfo.Friends;
+        if (friends.FriendAccountIds.Contains(target.ServerId))
+            throw new WebAPIException(WebAPIErrorCode.FriendAlreadyFriend);
+        EnsureFriendCapacity(account, target, false);
+
+        // Repeated sends leave one pending request. Receiving the reverse request still
+        // requires Accept; merely sending must not silently approve an incoming request.
+        if (target.ContentInfo.IdCard.AutoAcceptFriendRequest)
+            Befriend(account, target);
+        else
+        {
+            var requestLimit = _excelService.GetTable<ConstCommonExcelT>().First().MaxFriendsRequest;
+            if (!friends.SentRequestAccountIds.Contains(target.ServerId) && friends.SentRequestAccountIds.Count >= requestLimit)
+                throw new WebAPIException(WebAPIErrorCode.FriendMaxSentRequestReached);
+            if (!target.ContentInfo.Friends.ReceivedRequestAccountIds.Contains(account.ServerId) &&
+                target.ContentInfo.Friends.ReceivedRequestAccountIds.Count >= requestLimit)
+                throw new WebAPIException(WebAPIErrorCode.FriendMaxReceivedRequestReached);
+            friends.SentRequestAccountIds.Add(target.ServerId);
+            target.ContentInfo.Friends.ReceivedRequestAccountIds.Add(account.ServerId);
+        }
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
+        return response;
     }
 
     [ProtocolHandler(Protocol.Friend_GetIdCard)]
@@ -112,15 +221,7 @@ public class FriendHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        // the stored card only holds what SetIdCard writes; the live bits come off the account
-        var card = account.ContentInfo.IdCard;
-        card.Level = account.Level;
-        card.FriendCode = AccountHandler.BuildFriendCode(account.ServerId);
-        card.LastConnectTime = account.LastConnectTime;
-        if (card.RepresentCharacterUniqueId == 0)
-            card.RepresentCharacterUniqueId = account.RepresentCharacterServerId;
-
-        response.FriendIdCardDB = card;
+        response.FriendIdCardDB = BuildIdCard(db, account);
 
         return response;
     }
@@ -144,6 +245,7 @@ public class FriendHandler : ProtocolHandlerBase
         card.ShowRaidRanking = request.ShowRaidRanking;
         card.ShowArenaRanking = request.ShowArenaRanking;
         card.ShowEliminateRaidRanking = request.ShowEliminateRaidRanking;
+        card.ShowMultiFloorRaidClearedDifficulty = request.ShowMultiFloorRaidClearedDifficulty;
         card.CardBackgroundId = request.BackgroundId;
 
         db.Entry(account).Property(x => x.ContentInfo).IsModified = true;
@@ -170,23 +272,7 @@ public class FriendHandler : ProtocolHandlerBase
             return response;
         }
 
-        var attachment = db.GetAccountAttachments(match.ServerId).FirstOrDefault();
-
-        response.SearchResult =
-        [
-            new FriendDB
-            {
-                AccountId = match.ServerId,
-                Nickname = match.Nickname ?? "Sensei",
-                Level = match.Level,
-                RepresentCharacterUniqueId = match.RepresentCharacterServerId,
-                RepresentCharacterCostumeId = match.RepresentCharacterServerId,
-                LastConnectTime = account.GameSettings.ServerDateTime(),
-                ComfortValue = 10000,
-                FriendCount = 0,
-                AttachmentDB = attachment != null ? _mapper.Map<AccountAttachmentDB>(attachment) : null
-            }
-        ];
+        response.SearchResult = IsBlocked(account, match) ? [] : [BuildFriend(db, match)];
 
         return response;
     }
@@ -197,19 +283,21 @@ public class FriendHandler : ProtocolHandlerBase
         FriendGetFriendDetailedInfoRequest request,
         FriendGetFriendDetailedInfoResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
         var target = db.GetAccount(request.FriendAccountId);
+        EnsureNotBlocked(account, target, WebAPIErrorCode.FriendBlockUserCannotOpenProfile);
+        var profile = BuildFriend(db, target);
         var attachment = db.GetAccountAttachments(target.ServerId).FirstOrDefault();
 
         response.Nickname = target.Nickname;
         response.Level = target.Level;
         response.ClanName = "Schale Network";
         response.Comment = target.Comment;
-        response.FriendCount = 0;
+        response.FriendCount = target.ContentInfo.Friends.FriendAccountIds.Count;
         response.FriendCode = AccountHandler.BuildFriendCode(target.ServerId);
-        response.RepresentCharacterUniqueId = target.RepresentCharacterServerId;
-        response.RepresentCharacterCostumeId = target.RepresentCharacterServerId;
+        response.RepresentCharacterUniqueId = profile.RepresentCharacterUniqueId;
+        response.RepresentCharacterCostumeId = profile.RepresentCharacterCostumeId;
         response.CharacterCount = db.GetAccountCharacters(target.ServerId).Count();
         response.AttachmentDB = attachment != null ? _mapper.Map<AccountAttachmentDB>(attachment) : null;
         response.AssistCharacterDBs = [];
@@ -222,7 +310,7 @@ public class FriendHandler : ProtocolHandlerBase
             ClanName = "Schale Network",
             Comment = target.Comment,
             FriendCode = response.FriendCode,
-            RepresentCharacterUniqueId = target.RepresentCharacterServerId,
+            RepresentCharacterUniqueId = profile.RepresentCharacterUniqueId,
             CharacterCount = response.CharacterCount,
             AssistCharacterDBs = []
         };
@@ -230,7 +318,7 @@ public class FriendHandler : ProtocolHandlerBase
         return response;
     }
 
-    // no friend rows exist server-side, so every list mutation settles to the same empty lists
+    // Both accounts are saved together; no mutation returns a fabricated empty snapshot.
 
     [ProtocolHandler(Protocol.Friend_Remove)]
     public async Task<FriendRemoveResponse> Remove(
@@ -238,12 +326,19 @@ public class FriendHandler : ProtocolHandlerBase
         FriendRemoveRequest request,
         FriendRemoveResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
-        response.BlockedUserDBs = [];
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendRequestTargetIsYourself);
+        if (!account.ContentInfo.Friends.FriendAccountIds.Contains(target.ServerId))
+            throw new WebAPIException(WebAPIErrorCode.FriendUserIsNotFriend);
+        account.ContentInfo.Friends.FriendAccountIds.Remove(target.ServerId);
+        target.ContentInfo.Friends.FriendAccountIds.Remove(account.ServerId);
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
 
         return response;
     }
@@ -254,12 +349,20 @@ public class FriendHandler : ProtocolHandlerBase
         FriendAcceptFriendRequestRequest request,
         FriendAcceptFriendRequestResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
-        response.BlockedUserDBs = [];
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendRequestTargetIsYourself);
+        EnsureNotBlocked(account, target, WebAPIErrorCode.FriendBlockUserCannotSendRequest);
+        if (!account.ContentInfo.Friends.ReceivedRequestAccountIds.Contains(target.ServerId))
+            throw new WebAPIException(WebAPIErrorCode.FriendRequestNotFound);
+        EnsureFriendCapacity(account, target, true);
+        Befriend(account, target);
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
 
         return response;
     }
@@ -270,12 +373,18 @@ public class FriendHandler : ProtocolHandlerBase
         FriendDeclineFriendRequestRequest request,
         FriendDeclineFriendRequestResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
-        response.BlockedUserDBs = [];
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendRequestTargetIsYourself);
+        if (!account.ContentInfo.Friends.ReceivedRequestAccountIds.Remove(target.ServerId))
+            throw new WebAPIException(WebAPIErrorCode.FriendRequestNotFound);
+        target.ContentInfo.Friends.SentRequestAccountIds.Remove(account.ServerId);
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
 
         return response;
     }
@@ -286,12 +395,18 @@ public class FriendHandler : ProtocolHandlerBase
         FriendCancelFriendRequestRequest request,
         FriendCancelFriendRequestResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
-        response.BlockedUserDBs = [];
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendRequestTargetIsYourself);
+        if (!account.ContentInfo.Friends.SentRequestAccountIds.Remove(target.ServerId))
+            throw new WebAPIException(WebAPIErrorCode.FriendRequestNotFound);
+        target.ContentInfo.Friends.ReceivedRequestAccountIds.Remove(account.ServerId);
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
 
         return response;
     }
@@ -302,12 +417,24 @@ public class FriendHandler : ProtocolHandlerBase
         FriendBlockRequest request,
         FriendBlockResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
-        response.BlockedUserDBs = [];
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendBlockTargetIsYourself);
+        if (account.ContentInfo.Friends.BlockedAccountIds.Contains(target.ServerId))
+            throw new WebAPIException(WebAPIErrorCode.FriendBlockTargetIsAlreadyBlocked);
+        if (account.ContentInfo.Friends.BlockedAccountIds.Count >=
+            _excelService.GetTable<ConstCommonExcelT>().First().MaxBlockedUserCount)
+            throw new WebAPIException(WebAPIErrorCode.FriendBlockTargetIsExceedMaxCount);
+        account.ContentInfo.Friends.BlockedAccountIds.Add(target.ServerId);
+        account.ContentInfo.Friends.FriendAccountIds.Remove(target.ServerId);
+        target.ContentInfo.Friends.FriendAccountIds.Remove(account.ServerId);
+        ClearRequests(account, target);
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
 
         return response;
     }
@@ -318,12 +445,16 @@ public class FriendHandler : ProtocolHandlerBase
         FriendUnblockRequest request,
         FriendUnblockResponse response)
     {
-        await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        response.FriendDBs = [];
-        response.SentRequestFriendDBs = [];
-        response.ReceivedRequestFriendDBs = [];
-        response.BlockedUserDBs = [];
+        var target = GetTarget(db, account, request.TargetAccountId, WebAPIErrorCode.FriendBlockTargetIsYourself);
+        account.ContentInfo.Friends.BlockedAccountIds.Remove(target.ServerId);
+        await SavePair(db, account, target);
+        var lists = GetLists(db, account);
+        response.FriendDBs = lists.Friends;
+        response.SentRequestFriendDBs = lists.Sent;
+        response.ReceivedRequestFriendDBs = lists.Received;
+        response.BlockedUserDBs = lists.Blocked;
 
         return response;
     }

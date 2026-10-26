@@ -613,7 +613,7 @@ public class AccountHandler : ProtocolHandlerBase
 
         // Official LoginSync also carries a MultiFloorRaidLoginResponse child (on the wire it is just {"Protocol":49004}) and a PickupFirstGetHistoryDBs list ([] when empty).
         response.MultiFloorRaidLoginResponse = new MultiFloorRaidLoginResponse();
-        response.PickupFirstGetHistoryDBs = [];
+        response.PickupFirstGetHistoryDBs = account.ContentInfo.PickupFirstGetHistories ?? [];
 
         response.AccountLevelRewardIds = db.GetAccountLevelRewards(account.ServerId).Select(r => r.RewardId).ToList();
         _logger.LogInformation("All queries took {Ms}ms total", sw.ElapsedMilliseconds);
