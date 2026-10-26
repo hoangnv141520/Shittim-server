@@ -171,6 +171,14 @@ namespace Shittim_Server.Services
             logger.LogInformation("Restored client inface config: {ConfigPath}", path);
         }
 
+        public void RestoreForOfficial()
+        {
+            configPath = GetConfigPath();
+            RestoreOrphanedConfig();
+            if (!string.IsNullOrWhiteSpace(configPath) && File.Exists(GetStatePath(configPath)))
+                throw new IOException("Inface config restore is incomplete; verify the game files through Steam.");
+        }
+
         private void RestoreOrphanedConfig()
         {
             if (string.IsNullOrWhiteSpace(configPath) || !File.Exists(configPath))

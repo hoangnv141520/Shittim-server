@@ -135,6 +135,26 @@ namespace Shittim_Server.Services
             return Task.CompletedTask;
         }
 
+        public void RestoreForOfficial()
+        {
+            var target = GetGrap64Path();
+            if (string.IsNullOrWhiteSpace(target)) return;
+            var backup = target + ".bak";
+            var stub = GetStubPath();
+            static string Hash(string path) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)));
+            var isStub = File.Exists(target) && File.Exists(stub) && Hash(target) == Hash(stub);
+            if (!File.Exists(backup))
+            {
+                if (isStub) throw new IOException("The original grap64.dll backup is missing. Verify the game files through Steam.");
+                return;
+            }
+            if (File.Exists(stub) && Hash(backup) == Hash(stub))
+                throw new IOException("grap64.dll.bak contains the local stub. Verify the game files through Steam.");
+            if (File.Exists(target) && !isStub && Hash(target) != Hash(backup))
+                throw new IOException("grap64.dll differs from both the local stub and its backup. Verify the game files through Steam.");
+            File.Copy(backup, target, overwrite: true);
+        }
+
         private static bool IsEnabled()
         {
             var env = Environment.GetEnvironmentVariable("SHITTIM_AUTO_MANAGE_GRAP64");

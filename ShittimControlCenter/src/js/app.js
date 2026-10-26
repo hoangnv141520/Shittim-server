@@ -258,8 +258,9 @@ async function togglePower() {
   const up = isUp(store.get());
   sbPower.disabled = true;
   try {
-    if (up) { await window.host.systemStop(); toast(t('status.stoppingSystem'), 'warn'); }
-    else { await window.host.systemStart(); toast(t('status.startingSystem'), 'good'); }
+    const result = up ? await window.host.systemStop() : await window.host.systemStart();
+    if (!result.ok) toast(result.error || t('overview.offline.couldNotStart'), 'bad');
+    else toast(t(up ? 'status.stoppingSystem' : 'status.startingSystem'), up ? 'warn' : 'good');
   } finally { sbPower.disabled = false; }
 }
 

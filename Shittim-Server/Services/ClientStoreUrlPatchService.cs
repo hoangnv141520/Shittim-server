@@ -52,6 +52,8 @@ namespace Shittim_Server.Services
         }
 
         // The replacement is shorter than the stock url, so it goes down over the same bytes and only the record's length moves. That keeps the tail of the stock text sitting untouched under it and restoring is just writing all 56 bytes back.
+        public void RestoreForOfficial() => Rewrite(StockUrl);
+
         private void Rewrite(string url)
         {
             var path = ClientMetadataPatchService.GetMetadataPath();

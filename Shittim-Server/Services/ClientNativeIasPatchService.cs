@@ -250,6 +250,20 @@ namespace Shittim_Server.Services
             return Task.CompletedTask;
         }
 
+        public void RestoreForOfficial()
+        {
+            foreach (var module in Modules)
+            {
+                var path = GetModulePath(module);
+                if (string.IsNullOrWhiteSpace(path)) continue;
+                var statePath = GetStatePath(path);
+                var state = LoadState(statePath);
+                if (state != null) RestoreModule(state);
+                if (File.Exists(statePath))
+                    throw new IOException($"IAS routing restore is incomplete: {path}. Verify the game files through Steam.");
+            }
+        }
+
         private void RestoreDisabledModule(ModulePatchDefinition module)
         {
             try

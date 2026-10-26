@@ -5,6 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
+const http = require('http');
+const { createServerModeController } = require('./server-mode');
 const { spawn, execFile } = require('child_process');
 const { extractZip, installTree, resumeInterruptedInstall, backupUserData, writeFileAtomic, selfUpdateMode, blockerAdvice } = require('./updater');
 const { resolveRepoRoot, pathsFor, firstExisting, componentVersions, findMitmBinDir, mitmExe, dotnetExe } = require('./paths');
@@ -217,13 +219,14 @@ function startMitm(offline) {
       '--mode', 'reverse:http://127.0.0.3:5000@127.0.0.2:443',
       '--mode', 'reverse:http://127.0.0.3:5000@127.0.0.2:5000',
       '--mode', 'reverse:http://127.0.0.3:5100@127.0.0.2:5100']
-    : ['-m', 'wireguard', '--no-http2', '-s', 'redirect_server.py',
+    : ['-m', 'wireguard', '--no-http2', '-s', p.redirectScript,
       '--set', 'termlog_verbosity=warn', '--mode', 'local:BlueArchive.exe'];
   const cmd = mitmTool('mitmweb');
 
   // the addon reads this at import time and answers anything it has no local route for with a 502 instead of forwarding it, so a missed host shows up as a logged failure rather than a connection that hangs until it times out.
   const env = { ...process.env };
   if (offline) env.SHITTIM_OFFLINE_MODE = '1';
+  else delete env.SHITTIM_OFFLINE_MODE;
   // otherwise Python picks the ANSI codepage for open() and for its own stdio, and on a Chinese or Japanese install that is cp936/cp932 - the addon then dies reading a UTF-8 file with "'gbk' codec can't decode byte ... illegal multibyte sequence"
   env.PYTHONUTF8 = '1';
   env.PYTHONIOENCODING = 'utf-8';
@@ -326,12 +329,91 @@ async function setOfflineHosts(on) {
   const r = await runPwsh(ps, (l) => broadcast('proc:log', { source: 'mitm', line: l }));
   try { fs.unlinkSync(staged); } catch { /* ignore */ }
 
-  if (!r.ok) return { ok: false, error: 'the hosts file was not written - elevation was declined or the copy failed' };
+  if (!r.ok || offlineHostsApplied() !== on) return { ok: false, error: 'the hosts file was not written - elevation was declined or the copy failed' };
   broadcast('proc:log', { source: 'mitm', line: on ? `> pointed ${OFFLINE_HOSTS.length} hosts at 127.0.0.2` : '> removed the offline hosts entries' });
   return { ok: true, changed: true, applied: on };
 }
 
 // execFile and not exec: the argument is a path we resolved, and putting it through cmd.exe means cmd gets an opinion about it. Double quotes stop it splitting on spaces but not expanding %NAME%, so an install under a directory with a percent sign in it reports the SDK as missing when it is sitting right there.
+async function switchPreflight() {
+  if (process.platform !== 'win32') return { ok: false, error: 'Server switching is currently supported on Windows.' };
+  const script = "$ErrorActionPreference = 'Stop'; @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('BlueArchive.exe','Shittim-Server.exe','dotnet.exe','mitmweb.exe','mitmdump.exe','python.exe') } | Select-Object ProcessId,ParentProcessId,Name,CommandLine) | ConvertTo-Json -Compress";
+  const result = await execOut('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
+  if (!result.ok) return { ok: false, error: 'Could not check whether Blue Archive is closed.' };
+  let rows;
+  try { const value = JSON.parse(result.out || '[]'); rows = Array.isArray(value) ? value : [value]; }
+  catch { return { ok: false, error: 'Could not read the running-process list.' }; }
+  if (rows.some((r) => r.Name === 'BlueArchive.exe')) return { ok: false, error: 'Close Blue Archive before switching servers.' };
+  const ours = new Set([procs.server?.pid, procs.mitm?.pid].filter(Boolean));
+  // dotnet/mitmweb can hold their actual listener as a child process.
+  for (let i = 0; i < rows.length; i++) for (const row of rows) if (ours.has(row.ParentProcessId)) ours.add(row.ProcessId);
+  const external = rows.filter((r) => !ours.has(r.ProcessId) && (r.Name === 'Shittim-Server.exe'
+    || /redirect_server\.py/i.test(r.CommandLine || '')
+    || (r.Name === 'dotnet.exe' && /Shittim-Server(?:\.dll|\.csproj)/i.test(r.CommandLine || ''))));
+  if (external.length) return { ok: false, error: `Stop the server/proxy started outside this Control Center first: ${external.map((r) => `${r.Name} (PID ${r.ProcessId})`).join(', ')}` };
+  return { ok: true };
+}
+
+function restoreOfficialClient() {
+  const p = resolvePaths();
+  const dn = resolveDotnet();
+  const source = fs.existsSync(p.csproj);
+  if (!source && !p.exePath) return Promise.resolve({ ok: false, error: 'Server build is missing. Download or build the project first.' });
+  const cmd = source ? dn.cmd : p.exePath;
+  const args = source ? ['run', '--project', p.csproj, '--no-launch-profile', '--', '--restore-client'] : ['--restore-client'];
+  return new Promise((resolve) => {
+    let output = '';
+    const child = track(spawn(cmd, args, { cwd: p.serverDir, windowsHide: true, env: dotnetEnv(dn.root) }));
+    streamLines(child, (line) => {
+      output = (output + '\n' + line).slice(-32768);
+      broadcast('proc:log', { source: 'server', line });
+    });
+    const timer = setTimeout(async () => { await killTree(child); resolve({ ok: false, error: 'Client restore timed out. See the server log.' }); }, 180000);
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: e.message }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      let report;
+      for (const line of output.split('\n').reverse()) {
+        try { const json = JSON.parse(line); if (typeof json.ok === 'boolean') { report = json; break; } } catch { /* build/log line */ }
+      }
+      resolve(code === 0 && report?.ok ? { ok: true } : { ok: false,
+        error: report?.errors?.join('\n') || output.trim() || `Client restore exited with code ${code}.` });
+    });
+  });
+}
+
+async function waitForLocalServer() {
+  const port = Number(readConfig().data?.ServerConfiguration?.HostPort || 5000);
+  const until = Date.now() + 90000;
+  while (Date.now() < until) {
+    if (!procs.server || spawnFailed.server) return { ok: false, error: 'Local server exited during startup. See the server log.' };
+    const ready = await new Promise((resolve) => {
+      const req = http.get({ hostname: '127.0.0.1', port, path: '/health' }, (res) => { res.resume(); resolve(res.statusCode === 200); });
+      req.on('error', () => resolve(false));
+      req.setTimeout(1000, () => { req.destroy(); resolve(false); });
+    });
+    if (ready) return { ok: true };
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return { ok: false, error: 'Local server did not become ready in 90 seconds. See the server log.' };
+}
+
+const serverModes = createServerModeController({
+  preflight: switchPreflight,
+  saveMode: (mode) => saveSettings({ gameServerMode: mode }),
+  stopProxy: () => procs.mitm ? stopMitm() : Promise.resolve({ ok: true }),
+  stopServer: () => procs.server ? stopServer() : Promise.resolve({ ok: true }),
+  clearHosts: () => offlineHostsApplied() ? setOfflineHosts(false) : Promise.resolve({ ok: true }),
+  restoreClient: restoreOfficialClient,
+  startServer: () => startServer(),
+  waitForServer: waitForLocalServer,
+  startProxy: () => startMitm(),
+  waitForProxy: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    return procs.mitm && !spawnFailed.mitm ? { ok: true } : { ok: false, error: 'Local proxy could not start. See the proxy log.' };
+  },
+});
+
 function execCheck(cmd, args, timeout = 6000) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout, windowsHide: true }, (err, stdout, stderr) => {
@@ -1338,29 +1420,65 @@ ipcMain.handle('settings:write', (_e, patch) => {
 ipcMain.handle('config:read', () => readConfig());
 ipcMain.handle('config:write', (_e, payload) => writeConfig(payload));
 
-ipcMain.handle('server:start', () => startServer());
-ipcMain.handle('server:stop', () => stopServer());
-ipcMain.handle('mitm:start', () => startMitm());
-ipcMain.handle('mitm:stop', () => stopMitm());
+const switchInProgress = () => ({ ok: false, error: 'A server switch is already in progress.' });
+ipcMain.handle('server:start', async () => {
+  if (serverModes.switching) return switchInProgress();
+  const check = await switchPreflight();
+  if (!check.ok) return check;
+  const result = startServer();
+  if (result.ok) saveSettings({ gameServerMode: 'unknown' });
+  return result;
+});
+ipcMain.handle('server:stop', () => serverModes.switching ? switchInProgress() : stopServer());
+ipcMain.handle('mitm:start', async () => {
+  if (serverModes.switching) return switchInProgress();
+  const check = await switchPreflight();
+  if (!check.ok) return check;
+  const result = startMitm();
+  if (result.ok) saveSettings({ gameServerMode: 'unknown' });
+  return result;
+});
+ipcMain.handle('mitm:stop', () => serverModes.switching ? switchInProgress() : stopMitm());
 
 ipcMain.handle('system:start', () => {
-  const server = startServer();
-  const mitm = startMitm();
-  return { ok: server.ok || mitm.ok, server, mitm };
+  return serverModes.switchTo('local');
+});
+ipcMain.handle('game-mode:status', () => {
+  let mode = loadSettings().gameServerMode || 'unknown';
+  if (mode === 'local' && (!procs.server || !procs.mitm)) mode = 'unknown';
+  if (mode === 'official' && (procs.server || procs.mitm || offlineHostsApplied())) mode = 'unknown';
+  return { mode, switching: serverModes.switching };
+});
+ipcMain.handle('game-mode:switch', (_e, mode) => serverModes.switchTo(mode));
+ipcMain.handle('game-mode:launch', async () => {
+  if (serverModes.switching) return switchInProgress();
+  const mode = loadSettings().gameServerMode;
+  if (!['official', 'local'].includes(mode)) return { ok: false, error: 'Select a server mode first.' };
+  const check = await switchPreflight();
+  if (!check.ok) return check;
+  if (mode === 'local' && (!procs.server || !procs.mitm)) return { ok: false, error: 'Select Local server again to start the server and proxy.' };
+  try { await shell.openExternal('steam://rungameid/3557620'); return { ok: true }; }
+  catch (e) { return { ok: false, error: String(e.message || e) }; }
 });
 ipcMain.handle('system:stop', async () => {
+  if (serverModes.switching) return switchInProgress();
   const server = procs.server ? await stopServer() : { ok: true, error: 'Server not running' };
   const mitm = procs.mitm ? await stopMitm() : { ok: true, error: 'mitmproxy not running' };
   const hosts = offlineHostsApplied() ? await setOfflineHosts(false) : { ok: true, changed: false };
-  return { ok: server.ok && mitm.ok, server, mitm, hosts };
+  saveSettings({ gameServerMode: 'unknown' });
+  return { ok: server.ok && mitm.ok && hosts.ok, server, mitm, hosts };
 });
 
 // offline start: the hosts entries have to land before anything else, since the client resolves its first name within seconds of launch and a stale cache entry would send it out to the real address.
 ipcMain.handle('system:startOffline', async () => {
+  if (serverModes.switching) return switchInProgress();
+  const check = await switchPreflight();
+  if (!check.ok) return check;
   const hosts = await setOfflineHosts(true);
   if (!hosts.ok) return { ok: false, error: hosts.error, hosts };
   const server = startServer(true);
   const mitm = startMitm(true);
+  saveSettings({ gameServerMode: 'unknown' });
   return { ok: server.ok || mitm.ok, hosts, server, mitm };
 });
 ipcMain.handle('offline:status', () => ({ hosts: offlineHostsApplied(), hostnames: OFFLINE_HOSTS }));

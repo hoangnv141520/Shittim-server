@@ -688,5 +688,15 @@
   "projectGate.downloadFailed": "Download failed",
   "projectGate.toast.located": "Project located",
   "projectGate.noProjectInFolder": "No project found in that folder.",
-  "projectGate.notFound.short": "Not found"
+  "projectGate.notFound.short": "Not found",
+  "overview.gameMode.title": "Game server",
+  "overview.gameMode.description": "Close Blue Archive, select a server, then launch the game. Local progress and official progress stay separate. If an older client modification prevents official startup, use Verify game files.",
+  "overview.gameMode.official": "Official game",
+  "overview.gameMode.local": "Local server",
+  "overview.gameMode.launch": "Launch Blue Archive",
+  "overview.gameMode.verify": "Verify game files (Steam)",
+  "overview.gameMode.switching": "Switching server. Please wait...",
+  "overview.gameMode.selectedOfficial": "Selected: official game. Local routing patches restored.",
+  "overview.gameMode.selectedLocal": "Selected: local server. Server and proxy are ready.",
+  "overview.gameMode.unknown": "No server selected. Choose a mode before launching."
 }

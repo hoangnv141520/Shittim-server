@@ -51,6 +51,8 @@ namespace Shittim_Server.Services
             return Task.CompletedTask;
         }
 
+        public void RestoreForOfficial() => Apply("");
+
         private void Apply(string text)
         {
             var name = RegionName(text);

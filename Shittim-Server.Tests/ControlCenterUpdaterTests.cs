@@ -15,7 +15,7 @@ public class ControlCenterUpdaterTests
         Assert.True(Directory.Exists(Path.Combine(controlCenter, "node_modules", "i18next")),
             "ShittimControlCenter/node_modules has no i18next, so the Control Center suite cannot load. Run `npm install` in ShittimControlCenter, then re-run this test.");
 
-        var proc = Process.Start(new ProcessStartInfo("node", "--test test/updater.test.js test/paths.test.js test/console.test.js test/health.test.js test/procs.test.js test/certs.test.js")
+        var proc = Process.Start(new ProcessStartInfo("node", "--test test/updater.test.js test/paths.test.js test/console.test.js test/health.test.js test/procs.test.js test/certs.test.js test/setup.test.js test/i18n.test.js test/server-mode.test.js")
         {
             WorkingDirectory = controlCenter,
             RedirectStandardOutput = true,

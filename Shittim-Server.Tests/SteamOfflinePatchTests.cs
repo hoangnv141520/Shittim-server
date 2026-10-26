@@ -128,6 +128,17 @@ public class SteamOfflinePatchTests : IDisposable
         return path;
     }
 
+    [Fact]
+    public async Task StandaloneRestoreRevertsOfflineChangesWithoutStartingTheServer()
+    {
+        var path = WriteModule(Precheck);
+        var original = File.ReadAllBytes(path);
+        await Run();
+        Assert.NotEqual(original, File.ReadAllBytes(path));
+        new ClientSteamOfflinePatchService(_log).RestoreForOfficial();
+        Assert.Equal(original, File.ReadAllBytes(path));
+    }
+
     private async Task Run()
     {
         await new ClientSteamOfflinePatchService(_log).StartAsync(CancellationToken.None);

@@ -157,6 +157,14 @@ namespace Shittim_Server.Services
             return patchState;
         }
 
+        public void RestoreForOfficial()
+        {
+            metadataPath = GetMetadataPath();
+            RestoreMetadata();
+            if (!string.IsNullOrWhiteSpace(metadataPath) && File.Exists(GetStatePath(metadataPath)))
+                throw new IOException("Gateway key restore is incomplete; verify the game files through Steam.");
+        }
+
         private void RestoreMetadata()
         {
             var path = metadataPath ?? patchState?.MetadataPath;

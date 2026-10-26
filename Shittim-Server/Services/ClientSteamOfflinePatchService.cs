@@ -184,6 +184,12 @@ namespace Shittim_Server.Services
                 logger.LogInformation("Applied the Steam offline patch at {SiteCount} sites: {GameAssemblyPath}", pending.Count, gameAssemblyPath);
         }
 
+        public void RestoreForOfficial()
+        {
+            gameAssemblyPath = GetGameAssemblyPath();
+            Revert();
+        }
+
         private void Revert()
         {
             if (!File.Exists(gameAssemblyPath))

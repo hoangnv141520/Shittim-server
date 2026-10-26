@@ -145,6 +145,12 @@ namespace Shittim_Server.Services
                 logger.LogInformation("Applied the resource integrity patch at {SiteCount} site(s): {GameAssemblyPath}", pending.Count, gameAssemblyPath);
         }
 
+        public void RestoreForOfficial()
+        {
+            gameAssemblyPath = GetGameAssemblyPath();
+            Revert();
+        }
+
         private void Revert()
         {
             if (string.IsNullOrWhiteSpace(gameAssemblyPath) || !File.Exists(gameAssemblyPath))

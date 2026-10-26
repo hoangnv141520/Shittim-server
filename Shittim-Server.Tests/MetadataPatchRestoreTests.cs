@@ -88,6 +88,24 @@ public class MetadataPatchRestoreTests : IDisposable
         Assert.Equal(_official, File.ReadAllBytes(_path));
     }
 
+    [Fact]
+    public async Task StandaloneRestoreRecoversTheKeyAfterTheServerWasKilled()
+    {
+        await Run();
+        new ClientMetadataPatchService(_log).RestoreForOfficial();
+        Assert.Equal(_official, File.ReadAllBytes(_path));
+        Assert.False(File.Exists(_path + ".shittim_patch.json"));
+    }
+
+    [Fact]
+    public async Task StandaloneRestoreRejectsAMetadataFileThatChangedAfterPatching()
+    {
+        await Run();
+        using (var file = File.OpenWrite(_path)) { file.Position = 512; file.WriteByte(0); }
+        Assert.Throws<IOException>(() => new ClientMetadataPatchService(_log).RestoreForOfficial());
+        Assert.True(File.Exists(_path + ".shittim_patch.json"));
+    }
+
     private async Task Run()
     {
         var service = new ClientMetadataPatchService(_log);

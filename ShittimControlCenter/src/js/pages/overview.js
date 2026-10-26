@@ -41,6 +41,50 @@ export default {
     }
     const shortcutsCard = cardWith(t('overview.shortcuts.title'), null, [], shortcutBody);
 
+    const modeLine = el('p', { text: t('overview.gameMode.unknown'), style: { color: 'var(--ink-3)', margin: '12px 0' } });
+    modeLine.id = 'gameServerModeStatus';
+    modeLine.setAttribute('role', 'status');
+    const officialBtn = button(t('overview.gameMode.official'), { variant: 'primary', onClick: () => switchMode('official') });
+    const localBtn = button(t('overview.gameMode.local'), { variant: 'ghost', onClick: () => switchMode('local') });
+    const launchBtn = button(t('overview.gameMode.launch'), { variant: 'ghost', iconName: 'play', onClick: async () => {
+      const result = await window.host.gameModeLaunch();
+      if (!result.ok) toast(result.error, 'bad');
+      await loadGameMode();
+    } });
+    launchBtn.disabled = true;
+    const modeCard = cardWith(t('overview.gameMode.title'), null, [], el('div', {},
+      el('p', { text: t('overview.gameMode.description'), style: { color: 'var(--ink-3)', margin: '0 0 12px', lineHeight: '1.6' } }),
+      el('div.row.wrap', { style: { gap: '10px' } }, officialBtn, localBtn), modeLine,
+      el('div.row.wrap', { style: { gap: '10px' } }, launchBtn,
+        button(t('overview.gameMode.verify'), { variant: 'ghost', sm: true, onClick: () => window.host.openExternal('steam://validate/3557620') }))));
+
+    async function loadGameMode() {
+      try {
+        const state = await window.host.gameModeStatus();
+        modeLine.textContent = state.switching ? t('overview.gameMode.switching')
+          : state.mode === 'official' ? t('overview.gameMode.selectedOfficial')
+            : state.mode === 'local' ? t('overview.gameMode.selectedLocal') : t('overview.gameMode.unknown');
+        officialBtn.disabled = localBtn.disabled = state.switching;
+        for (const [btn, mode] of [[officialBtn, 'official'], [localBtn, 'local']]) {
+          btn.setAttribute('aria-pressed', String(state.mode === mode));
+          btn.classList.toggle('btn-primary', state.mode === mode);
+          btn.classList.toggle('btn-ghost', state.mode !== mode);
+        }
+        launchBtn.disabled = state.switching || !['official', 'local'].includes(state.mode);
+      } catch (e) { modeLine.textContent = String(e.message || e); }
+    }
+
+    async function switchMode(mode) {
+      officialBtn.disabled = localBtn.disabled = launchBtn.disabled = true;
+      modeLine.textContent = t('overview.gameMode.switching');
+      try {
+        const result = await window.host.gameModeSwitch(mode);
+        if (!result.ok) toast(result.error, 'bad', t('overview.gameMode.title'));
+        else toast(t(mode === 'official' ? 'overview.gameMode.selectedOfficial' : 'overview.gameMode.selectedLocal'), 'good');
+      } catch (e) { toast(String(e.message || e), 'bad'); }
+      finally { await loadGameMode(); await loadOffline(); }
+    }
+
     const hostsLine = el('p', { style: { fontSize: '12.5px', color: 'var(--ink-3)', margin: '12px 0 0', lineHeight: '1.6' } });
     const offlineBtn = button(t('overview.offline.start'), { variant: 'primary', iconName: 'play', onClick: () => startOffline() });
     const hostsBtn = button(t('overview.offline.restoreHosts'), { variant: 'ghost', sm: true, iconName: 'x', onClick: () => clearHosts() });
@@ -71,7 +115,7 @@ export default {
       el('div', {}, exportBtn,
         el('p', { text: t('overview.diagnostics.description'), style: { fontSize: '12.5px', color: 'var(--ink-3)', margin: '12px 0 0', lineHeight: '1.6' } })));
 
-    const right = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '18px', minWidth: '0' } }, offlineCard, shortcutsCard, diagnostics);
+    const right = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '18px', minWidth: '0' } }, modeCard, offlineCard, shortcutsCard, diagnostics);
     root.appendChild(el('div.grid-2', { style: { gridTemplateColumns: 'minmax(0, 1.3fr) minmax(0, 1fr)', alignItems: 'start' } }, readiness, right));
 
     function fixBtn(step, info) {
@@ -212,6 +256,9 @@ export default {
 
     loadDiag();
     loadOffline();
+    loadGameMode();
+    const modeTimer = setInterval(loadGameMode, 2000);
+    return () => clearInterval(modeTimer);
   },
 };
 
