@@ -83,7 +83,9 @@ public class ParcelHandler
             .Aggregate()
             .ConvertToConsume(isConsume);
 
-        await using var transaction = await context.Database.BeginTransactionAsync();
+        // A growth operation may own the transaction across both feeds and recipe costs.
+        await using var transaction = context.Database.CurrentTransaction == null
+            ? await context.Database.BeginTransactionAsync() : null;
         try
         {
             foreach (var parcel in filteredParcels)
@@ -186,7 +188,8 @@ public class ParcelHandler
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (transaction != null)
+                await transaction.RollbackAsync();
             throw;
         }
     }

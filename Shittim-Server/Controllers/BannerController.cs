@@ -11,14 +11,26 @@ public class BannerController : ControllerBase
     public IResult Image(string path)
     {
         // GetLocalizeBannerImageName splices the client's language in ahead of the extension, so one file on disk answers for every locale
-        var name = Path.GetFileNameWithoutExtension(path);
-        var cut = name.LastIndexOf('_');
-        var art = Path.Combine(AppContext.BaseDirectory, "Data", "Banner", (cut > 0 ? name[..cut] : name) + ".png");
+        var art = ResolveArt(Path.Combine(AppContext.BaseDirectory, "Data", "Banner"), path);
 
-        var file = System.IO.File.Exists(art) ? art : Path.Combine(AppContext.BaseDirectory, "Data", "Koyuki", "koyuki.png");
+        var file = art ?? Path.Combine(AppContext.BaseDirectory, "Data", "Koyuki", "koyuki.png");
         if (!System.IO.File.Exists(file))
             return Results.NotFound();
 
         return Results.Bytes(System.IO.File.ReadAllBytes(file), "image/png");
+    }
+
+    internal static string? ResolveArt(string directory, string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        if (string.IsNullOrEmpty(name)) return null;
+        var exact = Path.Combine(directory, name + ".png");
+        if (System.IO.File.Exists(exact)) return exact;
+        var cut = name.LastIndexOf('_');
+        if (cut <= 0 || !new[] { "en", "kr", "ko", "jp", "ja", "tw", "th", "zh" }
+                .Contains(name[(cut + 1)..], StringComparer.OrdinalIgnoreCase))
+            return null;
+        var localized = Path.Combine(directory, name[..cut] + ".png");
+        return System.IO.File.Exists(localized) ? localized : null;
     }
 }

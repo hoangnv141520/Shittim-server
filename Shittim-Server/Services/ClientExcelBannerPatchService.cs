@@ -6,11 +6,12 @@ using Schale.FlatData;
 
 namespace Shittim_Server.Services
 {
-    // The "View All Recruitments" list is built client-side from the client's encrypted ExcelDB.db; the server never serves it.
-    // Active recruitment rows with an empty GachaBannerPath draw as a blank but still selectable banner, and the empty slot pushes the real ones into a gap.
-    //
-    // So this patches the source: at startup it opens ExcelDB.db (SQLCipher, same key ExcelTableService uses) and fills each empty GachaBannerPath with the art of the most closely related banner - longest shared Id prefix, meaning the same event family.
-    // Same idea as ClientMetadataPatchService and global-metadata.dat.
+    // The recruitment list comes from the client's ExcelDB.db. Pickup tab artwork
+    // normally comes from Management_BannerList; GachaBannerPath is its asset fallback.
+    // Only reuse art backed by the same pickup characters or explicit banner link.
+    // Numeric ID prefixes do not identify artwork: normal and pickup rows share them.
+    // Read donors from the server's resource database so earlier client patches cannot
+    // become the source of another incorrect replacement.
     public class ClientExcelBannerPatchService : IHostedService
     {
         private const string SchemaTable = "ShopRecruitDBSchema";
@@ -51,6 +52,18 @@ namespace Shittim_Server.Services
         private void PatchBanners(string dbPath)
         {
             SqliteProvider.EnsureInitialized();
+            lock (ExcelTableService.loadLock)
+                PatchBannersLocked(dbPath);
+        }
+
+        private void PatchBannersLocked(string dbPath)
+        {
+            var sourcePath = Path.Combine(ResourceService.DumpedDir, "ExcelDB.db");
+            if (!File.Exists(sourcePath) || Path.GetFullPath(sourcePath).Equals(Path.GetFullPath(dbPath), StringComparison.OrdinalIgnoreCase))
+            {
+                logger.LogWarning("Client recruitment banners: independent resource database unavailable; skipping");
+                return;
+            }
             // ExcelDB flatbuffer strings are stored plaintext (the SQLCipher layer is the only encryption); read and write them as-is so non-modified fields round-trip byte-equal.
             TableEncryptionService.UseEncryption = false;
 
@@ -66,6 +79,65 @@ namespace Shittim_Server.Services
             var slots = ClientExcelSchema.RowSlots(typeof(ShopRecruitExcelT), "ShopRecruitExcel");
             var artSlot = slots[Array.FindIndex(typeof(ShopRecruitExcelT).GetProperties(), p => p.Name == nameof(ShopRecruitExcelT.GachaBannerPath))];
 
+            using var source = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = sourcePath,
+                Mode = SqliteOpenMode.ReadOnly
+            }.ToString());
+            source.Open();
+            ApplyKey(source);
+            var originals = ReadRows(source, slots).Select(r => r.Recruit).ToList();
+            var byId = originals.GroupBy(r => r.Id).ToDictionary(g => g.Key, g => g.First());
+            var rows = ReadRows(conn, slots);
+            var now = DateTime.Now;
+            var changes = new List<(BannerRow Row, string Art)>();
+            foreach (var row in rows.Where(r => !IsExpired(r.Recruit.SalePeriodTo, now)))
+            {
+                if (!byId.TryGetValue(row.Recruit.Id, out var original)) continue;
+                var replacement = ReplacementArt(row.Recruit, original, originals);
+                if (replacement != null) changes.Add((row, replacement));
+                else if (string.IsNullOrEmpty(row.Recruit.GachaBannerPath) && original.InfoCharacterId?.Count > 0)
+                    logger.LogWarning("Banner {Id}: no matching pickup artwork in resource data; leaving original path", original.Id);
+            }
+
+            if (changes.Count == 0)
+            {
+                logger.LogInformation("Client recruitment banners: no verified art changes to apply");
+                return;
+            }
+
+            var backupPath = dbPath + $".shittim-banner-backup-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
+            using (var backup = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = backupPath }.ToString()))
+            {
+                backup.Open();
+                ApplyKey(backup);
+                conn.BackupDatabase(backup);
+            }
+            logger.LogInformation("Client recruitment banner backup: {Path}", backupPath);
+
+            var patched = 0;
+            using (var tx = conn.BeginTransaction())
+            {
+                foreach (var (target, art) in changes)
+                {
+                    var newBytes = RealignedRowReader.WithString(target.Bytes, artSlot, art);
+                    if (newBytes == null) continue;
+                    using var upd = conn.CreateCommand();
+                    upd.Transaction = tx;
+                    upd.CommandText = $"UPDATE [{SchemaTable}] SET Bytes = @b WHERE rowid = @r";
+                    upd.Parameters.Add("@b", SqliteType.Blob).Value = newBytes;
+                    upd.Parameters.Add("@r", SqliteType.Integer).Value = target.RowId;
+                    upd.ExecuteNonQuery();
+                    patched++;
+                    logger.LogInformation("Banner {Id}: {OldArt} -> {Art}", target.Recruit.Id, target.Recruit.GachaBannerPath, art);
+                }
+                tx.Commit();
+            }
+            logger.LogInformation("Updated {Count} client recruitment banner art path(s)", patched);
+        }
+
+        private static List<BannerRow> ReadRows(SqliteConnection conn, int[] slots)
+        {
             var rows = new List<BannerRow>();
             using (var cmd = conn.CreateCommand())
             {
@@ -76,80 +148,44 @@ namespace Shittim_Server.Services
                     var rowid = reader.GetInt64(0);
                     var bytes = (byte[])reader[1];
                     var rec = (ShopRecruitExcelT)RealignedRowReader.Read(bytes, typeof(ShopRecruitExcelT), slots);
-                    rows.Add(new BannerRow(rowid, rec.Id, rec.GachaBannerPath ?? string.Empty, rec.SalePeriodTo, bytes));
+                    rows.Add(new BannerRow(rowid, rec, bytes));
                 }
             }
 
-            var withArt = rows.Where(r => !string.IsNullOrEmpty(r.Art)).ToList();
-            if (withArt.Count == 0)
-            {
-                logger.LogWarning("Client recruitment banners: no banner carries art to copy; skipping");
-                return;
-            }
-
-            var now = DateTime.Now;
-            // Only touch banners that can still be displayed (no end date / future / unparseable), so we don't rewrite hundreds of expired historical rows.
-            var targets = rows
-                .Where(r => string.IsNullOrEmpty(r.Art))
-                .Where(r => !IsExpired(r.SalePeriodTo, now))
-                .ToList();
-
-            if (targets.Count == 0)
-            {
-                logger.LogInformation("Client recruitment banners: no displayable empty-art rows to patch");
-                return;
-            }
-
-            var patched = 0;
-            using (var tx = conn.BeginTransaction())
-            {
-                foreach (var target in targets)
-                {
-                    var art = PickRelatedArt(target.Id, withArt);
-                    var newBytes = RealignedRowReader.WithString(target.Bytes, artSlot, art);
-                    if (newBytes == null)
-                        continue;
-
-                    using var upd = conn.CreateCommand();
-                    upd.Transaction = tx;
-                    upd.CommandText = $"UPDATE [{SchemaTable}] SET Bytes = @b WHERE rowid = @r";
-                    upd.Parameters.Add("@b", SqliteType.Blob).Value = newBytes;
-                    upd.Parameters.Add("@r", SqliteType.Integer).Value = target.RowId;
-                    upd.ExecuteNonQuery();
-                    patched++;
-
-                    logger.LogInformation("Banner {Id}: empty art -> {Art}", target.Id, art);
-                }
-                tx.Commit();
-            }
-
-            logger.LogInformation("Patched {Count} empty recruitment banner art path(s) in client ExcelDB", patched);
+            return rows;
         }
 
-        // Reuse the art of the banner whose Id shares the longest leading-digit run -> same event/family, so the blank slot shows that event's real banner image.
-        private static string PickRelatedArt(long emptyId, List<BannerRow> withArt)
+        internal static string? ReplacementArt(ShopRecruitExcelT current, ShopRecruitExcelT original, IReadOnlyCollection<ShopRecruitExcelT> originals)
         {
-            var key = emptyId.ToString();
-            var best = withArt[0].Art;
-            var bestScore = -1;
-            foreach (var candidate in withArt)
-            {
-                var score = CommonPrefixLength(key, candidate.Id.ToString());
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    best = candidate.Art;
-                }
-            }
-            return best;
+            // Migrate the old patch only when a pickup's shipped path was empty and
+            // the client now contains artwork belonging to a normal recruitment.
+            var wrongNormalArt = string.IsNullOrEmpty(original.GachaBannerPath)
+                && original.InfoCharacterId?.Count > 0
+                && !string.IsNullOrEmpty(current.GachaBannerPath)
+                && originals.Any(r => r.CategoryType == ShopCategoryType.NormalGacha
+                    && r.GachaBannerPath == current.GachaBannerPath);
+            if (!string.IsNullOrEmpty(current.GachaBannerPath) && !wrongNormalArt) return null;
+
+            var art = PickRelatedArt(original, originals);
+            if (art == null && wrongNormalArt) art = original.GachaBannerPath ?? string.Empty;
+            return art == (current.GachaBannerPath ?? string.Empty) ? null : art;
         }
 
-        private static int CommonPrefixLength(string a, string b)
+        internal static string? PickRelatedArt(ShopRecruitExcelT target, IReadOnlyCollection<ShopRecruitExcelT> originals)
         {
-            var n = Math.Min(a.Length, b.Length);
-            var i = 0;
-            while (i < n && a[i] == b[i]) i++;
-            return i;
+            if (!string.IsNullOrEmpty(target.GachaBannerPath)) return target.GachaBannerPath;
+            var characters = (target.InfoCharacterId ?? []).ToHashSet();
+            var matches = originals.Where(r => !string.IsNullOrEmpty(r.GachaBannerPath)
+                && r.CategoryType == target.CategoryType
+                && r.IsSelectRecruit == target.IsSelectRecruit
+                && r.IsNewbie == target.IsNewbie
+                && (characters.Count > 0
+                    ? characters.SetEquals(r.InfoCharacterId ?? [])
+                    : (r.InfoCharacterId?.Count ?? 0) == 0 && target.LinkedRobbyBannerId > 0
+                        && r.LinkedRobbyBannerId == target.LinkedRobbyBannerId))
+                .Select(r => r.GachaBannerPath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            // Conflicting images are ambiguous; do not select one by row order.
+            return matches.Count == 1 ? matches[0] : null;
         }
 
         private static bool IsExpired(string salePeriodTo, DateTime now)
@@ -197,6 +233,6 @@ namespace Shittim_Server.Services
             return SteamGameLocator.FindGameFile(relative) ?? string.Empty;
         }
 
-        private readonly record struct BannerRow(long RowId, long Id, string Art, string SalePeriodTo, byte[] Bytes);
+        private readonly record struct BannerRow(long RowId, ShopRecruitExcelT Recruit, byte[] Bytes);
     }
 }

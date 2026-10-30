@@ -467,7 +467,17 @@ public class ShopHandler : ProtocolHandlerBase
 
         var shopExcel = _excelService.GetTable<ShopExcelT>().FirstOrDefault(x => x.Id == request.ShopUniqueId);
         if (shopExcel == null)
+        {
+            var eventProduct = _excelService.GetTable<EventContentShopExcelT>()
+                .FirstOrDefault(x => x.Id == request.ShopUniqueId);
+            if (eventProduct != null)
+                shopExcel = EventShopCatalog.Product(eventProduct);
+        }
+        if (shopExcel == null)
             throw new WebAPIException(WebAPIErrorCode.ShopExcelNotFound, $"Shop {request.ShopUniqueId} not found");
+
+        if (shopExcel.GoodsId?.Contains(request.GoodsId) != true)
+            throw new WebAPIException(WebAPIErrorCode.ShopGoodsNotFound, $"Goods {request.GoodsId} does not belong to shop {request.ShopUniqueId}");
 
         var goodsExcel = _excelService.GetTable<GoodsExcelT>().FirstOrDefault(x => x.Id == request.GoodsId);
         if (goodsExcel == null)
@@ -506,7 +516,14 @@ public class ShopHandler : ProtocolHandlerBase
 
         if (consumeParcels.Count > 0)
         {
-            await _parcelHandler.BuildParcel(db, account, consumeParcels, isConsume: true);
+            var consumed = await _parcelHandler.BuildParcel(db, account, consumeParcels, isConsume: true);
+            response.ConsumeResultDB = new ConsumeResultDB
+            {
+                RemovedItemServerIds = consumed.ParcelResult.RemovedItemIds,
+                UsedItemServerIdAndRemainingCounts = consumed.ParcelResult.ItemDBs
+                    .Where(x => !consumed.ParcelResult.RemovedItemIds.Contains(x.Key))
+                    .ToDictionary(x => x.Key, x => x.Value.StackCount)
+            };
         }
 
         var parcelResultDB = new ParcelResultDB();

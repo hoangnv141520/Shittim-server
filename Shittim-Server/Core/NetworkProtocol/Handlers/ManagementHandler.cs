@@ -72,6 +72,12 @@ public class ManagementHandler : ProtocolHandlerBase
             });
         }
 
+        // Pickup tabs download Management banners matched by LinkedRobbyBannerId.
+        // Their shipped GachaBannerPath is deliberately empty (asset fallback only).
+        banners.AddRange(RecruitmentBannerService.Build(_excelService.GetTable<ShopRecruitExcelT>(),
+            account.GameSettings.ServerDateTime(), $"http://{server.HostAddress}:{server.HostPort}/banner/",
+            Path.Combine(AppContext.BaseDirectory, "Data", "Banner")));
+
         response.BannerDBs = banners;
 
         return response;

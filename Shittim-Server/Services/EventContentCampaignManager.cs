@@ -742,14 +742,17 @@ namespace Shittim_Server.Services
                 ? rewards.Where(x => x.RewardTag == RewardTag.ThreeStar).Select(ToParcel).ToList()
                 : new List<ParcelResult>();
 
-            var drops = rewards
+            var drops = RolledDrops(rewards);
+
+            return (firstClear, threeStar, drops);
+        }
+
+        internal static List<ParcelResult> RolledDrops(IEnumerable<EventContentStageRewardExcelT> rewards)
+            => rewards
                 .Where(x => x.RewardTag == RewardTag.Default || x.RewardTag == RewardTag.Rare || x.RewardTag == RewardTag.Event)
                 .Where(x => MathService.GenerateProbability(x.RewardProb))
                 .Select(ToParcel)
                 .ToList();
-
-            return (firstClear, threeStar, drops);
-        }
 
         private static ParcelResult ToParcel(EventContentStageRewardExcelT reward)
             => new(reward.RewardParcelType, reward.RewardId, reward.RewardAmount);

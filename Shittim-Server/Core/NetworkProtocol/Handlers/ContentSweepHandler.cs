@@ -54,8 +54,80 @@ public class ContentSweepHandler : ProtocolHandlerBase
         {
             ContentType.WeekDungeon => await SweepWeekDungeon(db, account, request, response),
             ContentType.SchoolDungeon => await SweepSchoolDungeon(db, account, request, response),
+            ContentType.EventContentMainStage or ContentType.EventContentSubStage
+                or ContentType.EventContentMainGroundStage or ContentType.EventContentStoryStage
+                or ContentType.EventContent => await SweepEvent(db, account, request, response),
             _ => await SweepCampaign(db, account, request, response)
         };
+    }
+
+    private async Task<ContentSweepResponse> SweepEvent(
+        SchaleDataContext db,
+        AccountDBServer account,
+        ContentSweepRequest request,
+        ContentSweepResponse response)
+    {
+        if (request.Count is <= 0 or > 10_000)
+            throw new WebAPIException(WebAPIErrorCode.InvalidSweepRequest, "Invalid event sweep count");
+
+        var stage = _excelService.GetTable<EventContentStageExcelT>()
+            .FirstOrDefault(x => x.Id == request.StageId);
+        if (stage == null || (request.EventContentId != 0 && request.EventContentId != stage.EventContentId))
+            throw new WebAPIException(WebAPIErrorCode.InvalidSweepRequest, "Event stage does not match the sweep request");
+
+        // ParcelHandler participates in this transaction: AP, rewards, exp and
+        // history must all commit together, including when a reward fails.
+        await using var transaction = db.Database.CurrentTransaction == null
+            ? await db.Database.BeginTransactionAsync() : null;
+        var history = await db.CampaignStageHistories.FirstOrDefaultAsync(x =>
+            x.AccountServerId == account.ServerId && x.StageUniqueId == stage.Id);
+        if (history == null || !history.IsClearedEver
+            || !history.Star1Flag || !history.Star2Flag || !history.Star3Flag)
+            throw new WebAPIException(WebAPIErrorCode.ContentSweepNotOpened, "Event sweep requires a three-star clear");
+
+        var cost = checked((long)stage.StageEnterCostAmount * request.Count);
+        var available = stage.StageEnterCostType switch
+        {
+            ParcelType.Currency => (await db.Currencies.FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId))?
+                .CurrencyDict.GetValueOrDefault((CurrencyTypes)stage.StageEnterCostId) ?? 0,
+            ParcelType.Item => await db.Items.Where(x => x.AccountServerId == account.ServerId
+                && x.UniqueId == stage.StageEnterCostId).SumAsync(x => x.StackCount),
+            _ => 0
+        };
+        if (cost < 0 || available < cost)
+            throw new WebAPIException(WebAPIErrorCode.InvalidSweepRequest, "Not enough event stage entrance currency");
+
+        await _parcelHandler.BuildParcel(db, account,
+            new ParcelResult(stage.StageEnterCostType, stage.StageEnterCostId, cost), isConsume: true);
+
+        var rewards = _excelService.GetTable<EventContentStageRewardExcelT>()
+            .GetAllRewardsByGroupId(stage.EventContentStageRewardId).ToList();
+        var gacha = _excelService.GetTable<GachaElementExcelT>();
+        var clearParcels = new List<List<ParcelInfo>>();
+        var allRewards = new List<ParcelResult>();
+        for (var i = 0; i < request.Count; i++)
+        {
+            // Roll each run separately; first-clear, permanent and three-star
+            // rewards must never be paid again by a sweep.
+            var drops = EventContentCampaignManager.RolledDrops(rewards).GenerateGachaGroup(gacha);
+            clearParcels.Add(ToParcelInfos(drops));
+            allRewards.AddRange(drops);
+        }
+        allRewards.Add(new ParcelResult(ParcelType.AccountExp, 0, cost));
+        var result = await _parcelHandler.BuildParcel(db, account, allRewards);
+
+        var now = account.GameSettings.ServerDateTime();
+        history.TodayPlayCount += request.Count;
+        history.LastPlay = now;
+        await db.SaveChangesAsync();
+        if (transaction != null) await transaction.CommitAsync();
+
+        response.ClearParcels = clearParcels;
+        response.BonusParcels = [];
+        response.EventContentBonusParcels = [];
+        response.ParcelResult = result.ParcelResult;
+        response.CampaignStageHistoryDB = history.ToMap(_mapper);
+        return response;
     }
 
     private async Task<ContentSweepResponse> SweepCampaign(

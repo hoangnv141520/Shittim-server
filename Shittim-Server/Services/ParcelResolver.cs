@@ -504,7 +504,7 @@ public class ParcelResolver
         });
     }
 
-    public async Task FinalizeUpdates(IDbContextTransaction transaction)
+    public async Task FinalizeUpdates(IDbContextTransaction? transaction)
     {
         var accountCurrencyDB = Context.Currencies.First(x => x.AccountServerId == Account.ServerId);
         if (Account.Level != accountCurrencyDB.AccountLevel)
@@ -519,7 +519,8 @@ public class ParcelResolver
         ParcelResult.AccountCurrencyDB = accountCurrencyDB.ToMap(Mapper);
 
         await Context.SaveChangesAsync();
-        await transaction.CommitAsync();
+        if (transaction != null)
+            await transaction.CommitAsync();
 
         foreach (var character in _updatedCharacters.Values)
         {

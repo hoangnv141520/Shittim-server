@@ -123,22 +123,7 @@ public class EventContentHandler : ProtocolHandlerBase
     // ShopExcel carries no EventContent_* row at all, so the tab is fed from EventContentShopExcel, which is the same shape keyed by event. SalePeriod on those rows is the phase calendar the run originally had - three rows on event 854 have one and the rest are blank - and keeping it would empty the shop of any event replayed outside its old window, which is the whole point of the schedule override.
     private List<ShopExcelT> EventShop(long eventContentId) => _excelService.GetTable<EventContentShopExcelT>()
         .Where(x => x.EventContentId == eventContentId)
-        .Select(x => new ShopExcelT
-        {
-            Id = x.Id,
-            LocalizeEtcId = x.LocalizeEtcId,
-            CategoryType = x.CategoryType,
-            IsLegacy = x.IsLegacy,
-            GoodsId = x.GoodsId,
-            DisplayOrder = x.DisplayOrder,
-            PurchaseCooltimeMin = x.PurchaseCooltimeMin,
-            PurchaseCountLimit = x.PurchaseCountLimit,
-            PurchaseCountResetType = x.PurchaseCountResetType,
-            BuyReportEventName = x.BuyReportEventName,
-            RestrictBuyWhenInventoryFull = x.RestrictBuyWhenInventoryFull,
-            SalePeriodFrom = "",
-            SalePeriodTo = ""
-        })
+        .Select(EventShopCatalog.Product)
         .ToList();
 
     [ProtocolHandler(Protocol.EventContent_ReceiveStageTotalReward)]
