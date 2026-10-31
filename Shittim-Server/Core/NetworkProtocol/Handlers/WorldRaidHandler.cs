@@ -50,7 +50,9 @@ public class WorldRaidHandler : ProtocolHandlerBase
             .Where(x => x.SeasonId == request.SeasonId)
             .ToMapList(_mapper);
         response.LocalBossDBs = localBoss.ToMapList(_mapper);
-        response.BossGroups = _worldRaidManager.BuildBossGroups(request.SeasonId);
+        // UIEventLobby enumerates this dictionary whenever local bosses exist, even
+        // when the season has no server-supplied schedule overrides.
+        response.BossGroups = _worldRaidManager.BuildBossGroups(request.SeasonId) ?? new();
         response.WorldRaidProgressDB = _worldRaidManager.Progress(db, account, request.SeasonId);
 
         return response;
