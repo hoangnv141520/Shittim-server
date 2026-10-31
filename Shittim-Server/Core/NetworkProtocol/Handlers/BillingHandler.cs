@@ -1,3 +1,7 @@
+using AutoMapper;
+
+using Schale.Data.GameModel;
+
 using BlueArchiveAPI.Services;
 using Schale.Data;
 using Schale.MX.GameLogic.DBModel;
@@ -15,16 +19,19 @@ public class BillingHandler : ProtocolHandlerBase
     private readonly ISessionKeyService _sessionService;
     private readonly ExcelTableService _excelTableService;
     private readonly ParcelHandler _parcelHandler;
+    private readonly IMapper? _mapper;
 
     public BillingHandler(
         IProtocolHandlerRegistry registry,
         ISessionKeyService sessionService,
         ExcelTableService excelTableService,
-        ParcelHandler parcelHandler) : base(registry)
+        ParcelHandler parcelHandler,
+        IMapper? mapper = null) : base(registry)
     {
         _sessionService = sessionService;
         _excelTableService = excelTableService;
         _parcelHandler = parcelHandler;
+        _mapper = mapper;
     }
 
     [ProtocolHandler(Protocol.Billing_PurchaseListByNexon)]
@@ -287,6 +294,9 @@ public class BillingHandler : ProtocolHandlerBase
         BillingPurchaseCashShopVerifyByNexonResponse response)
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
+        if (request.NpSN == -1)
+            throw new WebAPIException(WebAPIErrorCode.BillingProductSelectionSlotNotMatch,
+                "Offline purchases with product selections are not supported");
         
         var shopCashExcels = _excelTableService.GetTable<ShopCashExcelT>();
         var productExcels = _excelTableService.GetTable<ProductExcelT>();
@@ -313,19 +323,34 @@ public class BillingHandler : ProtocolHandlerBase
             });
         }
 
-        var parcelResultDB = new ParcelResultDB();
-        var parcelResult = await _parcelHandler.BuildParcel(db, account, parcels, parcelResultDB);
+        var mail = new MailDBServer
+        {
+            AccountServerId = account.ServerId,
+            Type = MailType.System,
+            UniqueId = 0,
+            Sender = "Cash Shop",
+            Comment = "Cash Shop Purchase",
+            LocalizedSender = Enum.GetValues<Language>().ToDictionary(lang => lang, _ => "Cash Shop"),
+            LocalizedComment = Enum.GetValues<Language>().ToDictionary(lang => lang, _ => "Cash Shop Purchase"),
+            SendDate = account.GameSettings.ServerDateTime(),
+            ExpireDate = account.GameSettings.ServerDateTime().AddDays(30),
+            ParcelInfos = parcels,
+            RemainParcelInfos = new List<ParcelInfo>()
+        };
 
-        response.ParcelResult = parcelResultDB;
+        db.Mails.Add(mail);
+        await db.SaveChangesAsync();
+
+        MailNotificationService.MarkNewMail(account.ServerId);
+
+        response.ServerNotification |= ServerNotificationFlag.NewMailArrived | ServerNotificationFlag.HasUnreadMail;
+        response.MailDB = _mapper?.Map<MailDB>(mail);
         response.PurchaseCount = 1;
         
         // Basic response fields to satisfy client
         response.shopId = request.ShopCashId.ToString();
         response.currency = request.CurrencyCode ?? "USD";
         response.itemPrice = request.CurrencyValue;
-
-        // Update history skipped (no table)
-        await db.SaveChangesAsync();
 
         return response;
     }

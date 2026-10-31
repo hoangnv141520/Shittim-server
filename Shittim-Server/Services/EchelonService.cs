@@ -39,12 +39,13 @@ public class EchelonService
     public static async Task<EchelonDBServer?> GetConcentratedCampaignEchelon(
         SchaleDataContext context, 
         long accountId, 
-        long echelonNum)
+        long echelonNum,
+        EchelonType echelonType = EchelonType.Adventure)
     {
         return await context.Echelons
             .FirstOrDefaultAsync(e =>
                 e.AccountServerId == accountId &&
-                e.EchelonType == EchelonType.Adventure &&
+                e.EchelonType == echelonType &&
                 e.EchelonNumber == echelonNum &&
                 e.ExtensionType == EchelonExtensionType.Base
             );

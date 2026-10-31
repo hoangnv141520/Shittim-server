@@ -6,6 +6,7 @@ using Schale.Data.GameModel;
 using Schale.Data.ModelMapping;
 using Schale.MX.NetworkProtocol;
 using Schale.MX.GameLogic.Parcel;
+using Schale.MX.GameLogic.DBModel;
 using Schale.FlatData;
 using Shittim_Server.Core;
 using Shittim_Server.Managers;
@@ -81,6 +82,7 @@ public class EquipmentHandler : ProtocolHandlerBase
             db, account, MissionCompleteConditionType.Achieve_EquipmentLevelUpCount);
         if (updatedMissions.Count > 0)
             response.MissionProgressDBs = updatedMissions;
+        await db.SaveChangesAsync();
 
         return response;
     }
@@ -103,6 +105,7 @@ public class EquipmentHandler : ProtocolHandlerBase
             db, account, MissionCompleteConditionType.Achieve_EquipmentTierUpCount);
         if (updatedMissions.Count > 0)
             response.MissionProgressDBs = updatedMissions;
+        await db.SaveChangesAsync();
 
         return response;
     }
@@ -115,7 +118,22 @@ public class EquipmentHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
+        var targetIds = request.EquipmentBatchGrowthRequestDBs.Select(x => x.TargetServerId).ToList();
+        var before = await db.Equipments.Where(x => x.AccountServerId == account.ServerId && targetIds.Contains(x.ServerId))
+            .Select(x => new { x.ServerId, x.Tier, x.Level }).ToDictionaryAsync(x => x.ServerId);
         var (equipmentDBs, gearDB, consumeResultDB, parcelResultDB) = await _equipmentManager.EquipmentBatchGrowth(db, account, request);
+        var tierUps = equipmentDBs.Sum(x => Math.Max(0, x.Tier - before[x.ServerId].Tier));
+        var levelUps = equipmentDBs.Count(x => x.Level > before[x.ServerId].Level);
+        var missions = new List<MissionProgressDB>();
+        if (tierUps > 0)
+            missions.AddRange(_missionService.UpdateMissionProgress(db, account,
+                MissionCompleteConditionType.Achieve_EquipmentTierUpCount, tierUps));
+        if (levelUps > 0)
+            missions.AddRange(_missionService.UpdateMissionProgress(db, account,
+                MissionCompleteConditionType.Achieve_EquipmentLevelUpCount, levelUps));
+        if (missions.Count > 0)
+            response.MissionProgressDBs = missions.DistinctBy(x => x.MissionUniqueId).ToList();
+        await db.SaveChangesAsync();
 
         response.EquipmentDBs = equipmentDBs.ToMapList(_mapper);
         response.GearDB = gearDB?.ToMap(_mapper);

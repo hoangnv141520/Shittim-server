@@ -57,6 +57,13 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
             await db.SaveChangesAsync();
         }
 
+        // Old servers used sequential instance IDs for Uid. The client instead
+        // indexes MinigameRoadPuzzleRailTileExcel by this value to build the preview.
+        if (row.SaveDB != null && RepairBoard(request.EventContentId, row.SaveDB))
+        {
+            db.Entry(row).Property(x => x.SaveDB).IsModified = true;
+            await db.SaveChangesAsync();
+        }
         response.SaveDB = row.SaveDB;
 
         return response;
@@ -77,6 +84,9 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
         if (tile == null || tile.Type == RoadPuzzleRailTileType.None)
             throw new WebAPIException(WebAPIErrorCode.MiniGameRoadPuzzleInvalidTilePlacement, "Tile placement carried no rail tile");
 
+        if (ResolveRail(request.EventContentId, board.UniqueId, tile.Type).UniqueId != tile.Uid)
+            throw new WebAPIException(WebAPIErrorCode.MiniGameRoadPuzzleInvalidTilePlacement, "Rail UID does not match its map template");
+
         if (board.remainingTiles == null || !board.remainingTiles.TryGetValue(tile.Type, out var left) || left <= 0)
             throw new WebAPIException(WebAPIErrorCode.MiniGameRoadPuzzleInvalidTilePlacement, $"No {tile.Type} rails left on map {board.UniqueId}");
 
@@ -90,16 +100,13 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
         var costParcels = ParcelResult.ConvertParcelResult(goods.ConsumeParcelType, goods.ConsumeParcelId, goods.ConsumeParcelAmount);
         var costResolver = await _parcelHandler.BuildParcel(db, account, costParcels, isConsume: true);
 
-        tile.Uid = board.placedRailTiles.Count == 0 ? 1 : board.placedRailTiles.Max(x => x.Uid) + 1;
         board.placedRailTiles.Add(tile);
 
-        if (left <= 1)
-            board.remainingTiles.Remove(tile.Type);
-        else
-            board.remainingTiles[tile.Type] = left - 1;
+        // The client's tile queue indexes every rail type, including depleted ones.
+        board.remainingTiles[tile.Type] = left - 1;
 
-        board.recentRandomRailTile = Draw(board.remainingTiles, tile.Uid + 1);
-        board.isTrainReadyToDepart = IsConnectedChain(board.placedRailTiles);
+        board.recentRandomRailTile = Draw(request.EventContentId, board.UniqueId, board.remainingTiles);
+        board.isTrainReadyToDepart = IsTrainReady(request.EventContentId, board);
 
         await db.SaveChangesAsync();
 
@@ -138,7 +145,7 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
             throw new WebAPIException(WebAPIErrorCode.MiniGameRoadPuzzleCannotSave, "Save stacked two rails on one hex");
 
         board.placedRailTiles = submitted;
-        board.isTrainReadyToDepart = IsConnectedChain(submitted);
+        board.isTrainReadyToDepart = IsTrainReady(request.EventContentId, board);
 
         await db.SaveChangesAsync();
 
@@ -178,7 +185,7 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
             var skipCost = ParcelResult.ConvertParcelResult(goods.ConsumeParcelType, goods.ConsumeParcelId, goods.ConsumeParcelAmount.Select(x => x * remaining).ToList());
             await _parcelHandler.BuildParcel(db, account, skipCost, isConsume: true);
         }
-        else if (!board.isTrainReadyToDepart)
+        else if (!IsTrainReady(request.EventContentId, board))
         {
             throw new WebAPIException(WebAPIErrorCode.MiniGameRoadPuzzleCannotTrainDeparture, $"The rails on map {board.UniqueId} do not form a track");
         }
@@ -298,7 +305,8 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
         var map = maps[Random.Shared.Next(maps.Count)];
         var railTiles = _excelService.GetTable<MinigameRoadPuzzleRailTileExcelT>().Where(x => x.EventContentId == eventContentId).ToList();
 
-        var remaining = new Dictionary<RoadPuzzleRailTileType, int>();
+        var remaining = Enum.GetValues<RoadPuzzleRailTileType>()
+            .Where(x => x != RoadPuzzleRailTileType.None).ToDictionary(x => x, _ => 0);
         var available = map.AvailableRailTile ?? [];
         var amounts = map.AvailableRailTileAmount ?? [];
         for (int i = 0; i < available.Count && i < amounts.Count; i++)
@@ -321,36 +329,84 @@ public class MiniGameRoadPuzzleHandler : ProtocolHandlerBase
             isTrainReadyToDepart = false
         };
 
-        board.recentRandomRailTile = Draw(remaining, 1);
+        board.recentRandomRailTile = Draw(eventContentId, map.UniqueId, remaining);
 
         return board;
     }
 
     // the draw is server-side so the tile the player is holding is not something the client can pick for itself
-    private static RoadPuzzleRailTileData? Draw(Dictionary<RoadPuzzleRailTileType, int>? remaining, long uid)
+    private RoadPuzzleRailTileData Draw(long eventContentId, long mapId, Dictionary<RoadPuzzleRailTileType, int>? remaining)
     {
-        if (remaining == null)
-            return null;
-
-        var total = remaining.Values.Sum();
+        var total = remaining?.Values.Sum() ?? 0;
         if (total <= 0)
-            return null;
+        {
+            // The client still dereferences the preview when updating an empty queue.
+            // Keep a valid display template; remainingTiles still prevents purchases.
+            var map = _excelService.GetTable<MinigameRoadPuzzleMapExcelT>()
+                .First(x => x.EventContentId == eventContentId && x.UniqueId == mapId);
+            var rail = _excelService.GetTable<MinigameRoadPuzzleRailTileExcelT>()
+                .First(x => x.EventContentId == eventContentId && map.AvailableRailTile.Contains(x.UniqueId));
+            return new RoadPuzzleRailTileData { Type = rail.RailTileType, Uid = rail.UniqueId };
+        }
 
         var roll = Random.Shared.Next(total);
-        foreach (var pair in remaining)
+        foreach (var pair in remaining!)
         {
             roll -= pair.Value;
             if (roll < 0)
-                return new RoadPuzzleRailTileData { Type = pair.Key, Uid = uid };
+                return new RoadPuzzleRailTileData { Type = pair.Key, Uid = ResolveRail(eventContentId, mapId, pair.Key).UniqueId };
         }
 
-        return null;
+        throw new InvalidOperationException("Rail inventory could not produce a weighted draw");
     }
+
+    private MinigameRoadPuzzleRailTileExcelT ResolveRail(long eventContentId, long mapId, RoadPuzzleRailTileType type)
+    {
+        var map = _excelService.GetTable<MinigameRoadPuzzleMapExcelT>()
+            .FirstOrDefault(x => x.EventContentId == eventContentId && x.UniqueId == mapId);
+        return _excelService.GetTable<MinigameRoadPuzzleRailTileExcelT>()
+            .FirstOrDefault(x => x.EventContentId == eventContentId && x.RailTileType == type
+                && map?.AvailableRailTile?.Contains(x.UniqueId) == true)
+            ?? throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound, $"No {type} rail template on event {eventContentId} map {mapId}");
+    }
+
+    private bool RepairBoard(long eventContentId, RoadPuzzleBoardSaveDB board)
+    {
+        var changed = false;
+        board.remainingTiles ??= [];
+        foreach (var type in Enum.GetValues<RoadPuzzleRailTileType>().Where(x => x != RoadPuzzleRailTileType.None))
+            changed |= board.remainingTiles.TryAdd(type, 0);
+        foreach (var tile in (board.placedRailTiles ?? []).Concat(board.recentRandomRailTile == null
+                     ? Array.Empty<RoadPuzzleRailTileData>() : new[] { board.recentRandomRailTile }))
+        {
+            var id = ResolveRail(eventContentId, board.UniqueId, tile.Type).UniqueId;
+            if (tile.Uid == id) continue;
+            tile.Uid = id;
+            changed = true;
+        }
+        if (board.recentRandomRailTile == null)
+        {
+            board.recentRandomRailTile = Draw(eventContentId, board.UniqueId, board.remainingTiles);
+            changed = true;
+        }
+        var ready = IsTrainReady(eventContentId, board);
+        if (board.isTrainReadyToDepart != ready)
+        {
+            board.isTrainReadyToDepart = ready;
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static bool IsTrainReady(long eventId, RoadPuzzleBoardSaveDB board)
+        => RoadPuzzleRouteValidator.IsReady(eventId, board.UniqueId, board.placedRailTiles)
+            ?? IsConnectedChain(board.placedRailTiles ?? []);
 
     private static bool SameHex(Schale.MX.Campaign.HexLocation a, Schale.MX.Campaign.HexLocation b)
         => a.x == b.x && a.y == b.y && a.z == b.z;
 
-    // the map itself - start tile, end tile and the rails already laid on it - is an addressable the client loads locally and no excel row exposes, so the server cannot verify a start-to-end route. What it can verify is that the paid rails form one unbranched run, which is what a track looks like and what a scattering of speculatively placed tiles does not.
+    // Compatibility fallback for maps whose authored layouts have not been recovered.
+    // Known layouts use RoadPuzzleRouteValidator, including fixed rails and port directions.
     private static bool IsConnectedChain(List<RoadPuzzleRailTileData> tiles)
     {
         // a lone rail passes every shape test there is, so it cannot count as a track

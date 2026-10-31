@@ -256,6 +256,8 @@ namespace Shittim_Server.Services
 
             if (stageSaveData == null)
                 throw new InvalidOperationException($"Event stage save not found for stage {req.Summary.StageId}");
+            if (!stageSaveData.IsOpen)
+                throw new WebAPIException(WebAPIErrorCode.CampaignStagePlayLimit, "Event campaign run is already closed");
 
             var stageExcel = _excelService.GetTable<EventContentStageExcelT>()
                 .FirstOrDefault(x => x.Id == req.Summary.StageId);
@@ -327,8 +329,9 @@ namespace Shittim_Server.Services
             if (isStageClear)
             {
                 historyDb.Star1Flag = true;
-                historyDb.Star2Flag = stageExcel != null && stageSaveData.CurrentTurn <= stageExcel.StarConditionTurnCount;
-                historyDb.Star3Flag = stageExcel != null && stageSaveData.TacticRankSCount >= stageExcel.StarConditionTacticRankSCount;
+                historyDb.TodayPlayCount = 1;
+                historyDb.Star2Flag = stageExcel != null && stageSaveData.TacticRankSCount >= stageExcel.StarConditionTacticRankSCount;
+                historyDb.Star3Flag = stageExcel != null && stageSaveData.CurrentTurn <= stageExcel.StarConditionTurnCount;
                 historyDb.ClearTurnRecord = stageSaveData.CurrentTurn;
                 historyDb.TacticClearCountWithRankSRecord = stageSaveData.TacticRankSCount;
                 historyDb.IsClearedEver = true;
@@ -903,8 +906,7 @@ namespace Shittim_Server.Services
             if (newHistoryDb.TacticClearCountWithRankSRecord > existHistoryDb.TacticClearCountWithRankSRecord)
                 existHistoryDb.TacticClearCountWithRankSRecord = newHistoryDb.TacticClearCountWithRankSRecord;
 
-            existHistoryDb.TodayPlayCount += 1;
-            existHistoryDb.LastPlay = dateTime;
+            CampaignDailyPlays.Record(existHistoryDb, dateTime, newHistoryDb.TodayPlayCount);
 
             context.CampaignStageHistories.Update(existHistoryDb);
         }

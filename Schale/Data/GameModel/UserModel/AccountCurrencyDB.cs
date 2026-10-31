@@ -70,9 +70,13 @@ namespace Schale.Data.GameModel
         {
             if (currencyType == CurrencyTypes.Invalid) return;
 
+            var held = GetCurrencyAmount(currencyType);
+            if (amount < 0 && (amount == long.MinValue || held < -amount))
+                throw new WebAPIException(WebAPIErrorCode.AccountCurrencyCannotAffordCost);
+            var updated = checked(held + amount);
             EnsureCurrencyExists(currencyType, timestamp);
             
-            CurrencyDict[currencyType] += amount;
+            CurrencyDict[currencyType] = updated;
             UpdateTimeDict[currencyType] = timestamp;
         }
 

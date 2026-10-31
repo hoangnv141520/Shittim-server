@@ -9,6 +9,7 @@ using Schale.FlatData;
 using Schale.MX.Core.Math;
 using Schale.MX.GameLogic.DBModel;
 using Schale.MX.GameLogic.Parcel;
+using Schale.MX.NetworkProtocol;
 using Shittim_Server.Services;
 using Shittim.Services;
 using Serilog;
@@ -22,6 +23,7 @@ public class ParcelResolver
     private IMapper Mapper { get; set; }
     private bool IsConsume { get; set; }
     private List<CurrencyExcelT> CurrencyExcels { get; set; }
+    private long ActionPointCap { get; }
 
     public ParcelResultDB ParcelResult { get; set; }
     public List<ParcelInfo> ParcelInfos { get; set; } = [];
@@ -43,13 +45,15 @@ public class ParcelResolver
         IMapper mapper,
         ParcelResultDB? parcelResult,
         bool isConsume,
-        List<CurrencyExcelT> currencyExcels)
+        List<CurrencyExcelT> currencyExcels,
+        long actionPointCap)
     {
         Context = context;
         Account = account;
         Mapper = mapper;
         IsConsume = isConsume;
         CurrencyExcels = currencyExcels;
+        ActionPointCap = actionPointCap;
         ParcelResult = parcelResult ?? new ParcelResultDB
         {
             // AccountDB is deliberately not pre-filled: FinalizeUpdates adds it only if the reward actually modified the account row.
@@ -125,15 +129,22 @@ public class ParcelResolver
 
         accountCurrencyDB.UpdateAccountLevel(Account.Level);
 
+        var apRow = CurrencyExcels.First(x => x.CurrencyType == CurrencyTypes.ActionPoint);
+        if (type == CurrencyTypes.ActionPoint)
+            ActionPointRegeneration.Apply(accountCurrencyDB, dateTime, ActionPointCap, apRow.AutoChargeMsc, apRow.AutoChargeAmount);
+        var apClock = accountCurrencyDB.UpdateTimeDict.GetValueOrDefault(CurrencyTypes.ActionPoint, dateTime);
+
         if (isAccountLevelUp && type == CurrencyTypes.ActionPoint &&
             amount > accountCurrencyDB.CurrencyDict[CurrencyTypes.ActionPoint])
             return;
 
         if (IsConsume && type == CurrencyTypes.Gem)
             accountCurrencyDB.SubtractGem(amount, dateTime);
-
-        accountCurrencyDB.UpdateCurrency(type, amount, dateTime);
+        else
+            accountCurrencyDB.UpdateCurrency(type, amount, dateTime);
         accountCurrencyDB.UpdateGem(dateTime);
+        if (type == CurrencyTypes.ActionPoint && accountCurrencyDB.CurrencyDict[type] < ActionPointCap)
+            accountCurrencyDB.UpdateTimeDict[type] = apClock;
 
         // AP held past OverChargeLimit is invisible to the player - the client clamps the counter at 999, so a stored 1400 spends down without the number ever moving. Official never stores the excess: it goes out as an InventoryFull mail.
         if (!IsConsume && type == CurrencyTypes.ActionPoint)
@@ -169,6 +180,29 @@ public class ParcelResolver
             x.UniqueId == parcel.Id &&
             x.BoundCharacterServerId == 0);
 
+        if (IsConsume)
+        {
+            var cost = Math.Abs(parcel.Amount);
+            if (equipment == null || equipment.StackCount < cost)
+                throw new WebAPIException(WebAPIErrorCode.AccountItemCannotAffordCost, $"Insufficient equipment stack for UniqueId {parcel.Id}");
+
+            equipment.StackCount -= cost;
+            if (equipment.StackCount <= 0)
+            {
+                equipment.StackCount = 0;
+                Context.Equipments.Remove(equipment);
+                ParcelResult.RemovedEquipmentIds.Add(equipment.ServerId);
+            }
+
+            if (ParcelResult.EquipmentDBs.TryGetValue(equipment.ServerId, out EquipmentDB? value))
+                value.StackCount = equipment.StackCount;
+            else
+                ParcelResult.EquipmentDBs.Add(equipment.ServerId, equipment.ToMap(Mapper));
+
+            CreateParcelInfo(parcel);
+            return;
+        }
+
         if (equipment == null && parcel.Amount > 0)
         {
             equipment = new EquipmentDBServer()
@@ -186,6 +220,7 @@ public class ParcelResolver
         {
             if ((equipment.StackCount + parcel.Amount) <= 0)
             {
+                equipment.StackCount = 0;
                 Context.Equipments.Remove(equipment);
                 ParcelResult.RemovedEquipmentIds.Add(equipment.ServerId);
             }
@@ -206,6 +241,29 @@ public class ParcelResolver
             x.AccountServerId == Account.ServerId &&
             x.UniqueId == parcel.Id);
 
+        if (IsConsume)
+        {
+            var cost = Math.Abs(parcel.Amount);
+            if (item == null || item.StackCount < cost)
+                throw new WebAPIException(WebAPIErrorCode.AccountItemCannotAffordCost, $"Insufficient item stack for UniqueId {parcel.Id}");
+
+            item.StackCount -= cost;
+            if (item.StackCount <= 0)
+            {
+                item.StackCount = 0;
+                Context.Items.Remove(item);
+                ParcelResult.RemovedItemIds.Add(item.ServerId);
+            }
+
+            if (ParcelResult.ItemDBs.TryGetValue(item.ServerId, out ItemDB? value))
+                value.StackCount = item.StackCount;
+            else
+                ParcelResult.ItemDBs.Add(item.ServerId, item.ToMap(Mapper));
+
+            CreateParcelInfo(parcel);
+            return;
+        }
+
         if (item == null && parcel.Amount > 0)
         {
             item = new ItemDBServer()
@@ -223,6 +281,7 @@ public class ParcelResolver
         {
             if ((item.StackCount + parcel.Amount) <= 0)
             {
+                item.StackCount = 0;
                 Context.Items.Remove(item);
                 ParcelResult.RemovedItemIds.Add(item.ServerId);
             }

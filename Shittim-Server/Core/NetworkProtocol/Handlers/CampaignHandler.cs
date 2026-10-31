@@ -1,4 +1,4 @@
-using AutoMapper;
+﻿using AutoMapper;
 using Microsoft.EntityFrameworkCore;
 using BlueArchiveAPI.Services;
 using Schale.Data;
@@ -42,6 +42,9 @@ public class CampaignHandler : ProtocolHandlerBase
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
         response.CampaignChapterClearRewardHistoryDBs = db.GetAccountCampaignChapterClearRewardHistories(account.ServerId).ToMapList(_mapper);
+        foreach (var history in await db.CampaignStageHistories.Where(x => x.AccountServerId == account.ServerId).ToListAsync())
+            CampaignDailyPlays.Reset(history, account.GameSettings.ServerDateTime());
+        await db.SaveChangesAsync();
         response.StageHistoryDBs = db.GetAccountCampaignStageHistories(account.ServerId).ToMapList(_mapper);
         response.StrategyObjecthistoryDBs = db.GetAccountStrategyObjectHistories(account.ServerId).ToMapList(_mapper);
 
@@ -211,15 +214,10 @@ public class CampaignHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
-        var parcelInfo = _campaignManager.TemporaryCampaignParcelInit(db, account, request.StageUniqueId);
-
-        response.SaveDataDB = new()
-        {
-            AccountServerId = account.ServerId,
-            CreateTime = account.GameSettings.ServerDateTime(),
-            StageUniqueId = request.StageUniqueId,
-            StageEntranceFee = parcelInfo
-        };
+        // Retry enters the deployment phase of a new run, with the same authored map
+        // and start-event activations as EnterMainStage. ConfirmMainStage owns the AP charge.
+        var stageSave = await _concentrateCampaignManager.CreateConcentrateCampaign(db, account, request.StageUniqueId);
+        response.SaveDataDB = ConcentrateCampaignManager.ShapeForWire(stageSave.ToMap(_mapper));
 
         return response;
     }

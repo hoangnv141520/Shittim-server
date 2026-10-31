@@ -1,4 +1,4 @@
-using AutoMapper;
+﻿using AutoMapper;
 using BlueArchiveAPI.Services;
 using Microsoft.EntityFrameworkCore;
 using Schale.Data;
@@ -101,7 +101,7 @@ public class ConcentrateCampaignManager
         return open.Count;
     }
 
-    // Event runs name their map on the save row because a rerun replays the original event's file; campaign rows leave it null and the stage id is the name.
+    // New saves retain the authored map name; older campaign saves fall back to the stage-id convention.
     internal Task<HexaTileMap> LoadStageMap(CampaignMainStageSaveDBServer save)
         => save.StrategyMap != null ? _hexaMapService.LoadState(save.StrategyMap) : _hexaMapService.LoadState(save.StageUniqueId);
 
@@ -110,14 +110,17 @@ public class ConcentrateCampaignManager
         AccountDBServer account,
         long stageUniqueId)
     {
-        var hexaData = await _hexaMapService.LoadState(stageUniqueId);
+        var stageExcel = _excelService.GetTable<CampaignStageExcelT>()
+            .FirstOrDefault(x => x.Id == stageUniqueId);
+        var mapName = string.IsNullOrWhiteSpace(stageExcel?.StrategyMap) ? null : stageExcel.StrategyMap;
+        var hexaData = mapName is null
+            ? await _hexaMapService.LoadState(stageUniqueId)
+            : await _hexaMapService.LoadState(mapName);
 
         // entering a stage abandons whatever the player was in before it - only one campaign run can be open at a time, and the new one is what ContentSave_Get owes from here on
         await CloseConcentrateCampaigns(context, account);
 
         // official's save carries the stage's enter cost (e.g. 10 AP) as a parcel list; it drives the fee display and the retreat refund
-        var stageExcel = _excelService.GetTable<CampaignStageExcelT>()
-            .FirstOrDefault(x => x.Id == stageUniqueId);
         List<ParcelInfo> entranceFee = stageExcel is null
             ? []
             : ParcelInfo.CreateParcelInfo(
@@ -141,11 +144,18 @@ public class ConcentrateCampaignManager
             DeployedEchelonInfos = new List<HexaUnit>(),
             CreateTime = account.GameSettings.ServerDateTime(),
             StageUniqueId = stageUniqueId,
+            StrategyMap = mapName,
             StageEntranceFee = entranceFee,
             EnemyKillCountByUniqueId = new(),
             IsOpen = true
         };
         stageSave.AccountServerId = account.ServerId;
+        var claimedObjects = await context.GetAccountStrategyObjectHistories(account.ServerId)
+            .Select(x => x.StrategyObjectId).ToListAsync();
+        foreach (var key in stageSave.StrategyObjects.Where(x => claimedObjects.Contains(x.Value.Id)
+            && _excelService.GetTable<CampaignStrategyObjectExcelT>().Any(e => e.Id == x.Value.Id
+                && e.StrategyObjectType == StrategyObjectType.ParcelOneTimePerAccount)).Select(x => x.Key).ToList())
+            stageSave.StrategyObjects.Remove(key);
 
         context.CampaignMainStageSaves.Add(stageSave);
         await context.SaveChangesAsync();
@@ -206,7 +216,8 @@ public class ConcentrateCampaignManager
         stageSaveData.EchelonInfos ??= new Dictionary<long, HexaUnit>();
 
         stageSaveData.EchelonInfos = await DeployConcentratedEchelon(
-            context, account, stageSaveData.EchelonInfos, deployReq.DeployedEchelons);
+            context, account, stageSaveData.EchelonInfos, deployReq.DeployedEchelons,
+            stageSaveData.ContentType == ContentType.StoryStrategyStage ? EchelonType.StoryStrategyStage : EchelonType.Adventure);
 
         context.Entry(stageSaveData).Property(x => x.EchelonInfos).IsModified = true;
         await context.SaveChangesAsync();
@@ -218,7 +229,8 @@ public class ConcentrateCampaignManager
         SchaleDataContext context,
         AccountDBServer account,
         Dictionary<long, HexaUnit> existHexaUnitData,
-        List<HexaUnit> hexaUnitData)
+        List<HexaUnit> hexaUnitData,
+        EchelonType echelonType)
     {
         foreach (var unit in hexaUnitData)
         {
@@ -231,7 +243,7 @@ public class ConcentrateCampaignManager
         {
             movementOrder++;
             var echelonData = await EchelonService.GetConcentratedCampaignEchelon(
-                context, account.ServerId, hexaUnit.EntityId);
+                context, account.ServerId, hexaUnit.EntityId, echelonType);
 
             if (echelonData == null)
                 continue;
@@ -285,6 +297,9 @@ public class ConcentrateCampaignManager
             throw new InvalidOperationException($"Campaign stage save not found for stage {stageReq.StageUniqueId}");
 
         // the fee is charged when the run actually starts, not at map entry - backing out of echelon select is free, and Confirm fires once per run so a resumed save can't pay twice
+        if (stageSaveData.CampaignState == CampaignState.BeforeStart && stageSaveData.ContentType == Schale.FlatData.ContentType.CampaignMainStage)
+            await CampaignDailyPlays.CheckHardLimit(context, account,
+                _excelService.GetTable<CampaignStageExcelT>().First(x => x.Id == stageReq.StageUniqueId), 1, _excelService);
         if (stageSaveData.CampaignState == CampaignState.BeforeStart && stageSaveData.StageEntranceFee is { Count: > 0 })
             await _parcelHandler.BuildParcel(context, account, stageSaveData.StageEntranceFee, isConsume: true);
 
@@ -335,6 +350,8 @@ public class ConcentrateCampaignManager
                 ActionCount = echelon.ActionCount,
             };
 
+            await CollectMapReward(context, stageSaveData, moveReq.EchelonEntityId);
+
             // fresh HexLocation2D rather than a write through the existing one - the snapshot above holds that reference, and the mapped wire copy shares it too
             echelon.Location = new HexLocation2D
             {
@@ -352,10 +369,33 @@ public class ConcentrateCampaignManager
             HexaMapService.AddHexaDisplayInfo(moveReq.EchelonEntityId, moveReq.DestPosition),
         };
 
+        await CollectMapReward(context, stageSaveData, moveReq.EchelonEntityId);
+
         context.CampaignMainStageSaves.Update(stageSaveData);
         await context.SaveChangesAsync();
 
         return (stageSaveData, preMove);
+    }
+
+    // Boxes are staged in the run and paid only when the mission is won.
+    internal async Task CollectMapReward(SchaleDataContext context, CampaignMainStageSaveDBServer save, long entityId)
+    {
+        if (!save.IsOpen || !save.EchelonInfos.TryGetValue(entityId, out var unit)) return;
+        var obj = save.StrategyObjects.Values.FirstOrDefault(x => LocationKey(x.Location) == LocationKey(unit.Location));
+        if (obj == null) return;
+        var excel = _excelService.GetTable<CampaignStrategyObjectExcelT>().FirstOrDefault(x => x.Id == obj.Id);
+        if (excel == null || (excel.StrategyObjectType != StrategyObjectType.Parcel
+            && excel.StrategyObjectType != StrategyObjectType.ParcelOneTimePerAccount)) return;
+        var oneTime = excel.StrategyObjectType == StrategyObjectType.ParcelOneTimePerAccount;
+        var alreadyClaimed = oneTime && await context.GetAccountStrategyObjectHistories(save.AccountServerId)
+            .AnyAsync(x => x.StrategyObjectId == obj.Id);
+        if (!alreadyClaimed && excel.StrategyRewardParcelType != ParcelType.None && excel.StrategyRewardAmount > 0)
+        {
+            save.StrategyObjectRewards[obj.EntityId] = ParcelInfo.CreateParcelInfo(
+                excel.StrategyRewardParcelType, excel.StrategyRewardID, excel.StrategyRewardAmount);
+            if (oneTime && !save.StrategyObjectHistory.Contains(obj.Id)) save.StrategyObjectHistory.Add(obj.Id);
+        }
+        if (excel.Disposable || alreadyClaimed) save.StrategyObjects.Remove(obj.EntityId);
     }
 
     // MovementOrder is one counter shared by the whole force, not a per-echelon step count: deploy hands out 1 and 2, then every move takes the next value in turn, so a two-echelon run reads 3, 4, 5, 6. A tactic does not consume a slot.
@@ -407,7 +447,7 @@ public class ConcentrateCampaignManager
         return save;
     }
 
-    // A portal jump is not a move: the echelon lands on the linked portal's tile without spending its action or a movement slot, and the client plays the jump itself so no DisplayInfos entry rides along.
+    // Portal jumps preserve action and movement order, but must carry WarpUnit so the client teleports instead of trying to walk between disconnected portal tiles.
     public async Task<CampaignMainStageSaveDBServer> UsePortal(
         SchaleDataContext context,
         AccountDBServer account,
@@ -417,35 +457,60 @@ public class ConcentrateCampaignManager
         if (stageSaveData == null)
             throw new InvalidOperationException($"Campaign stage save not found for stage {req.StageUniqueId}");
 
-        if (stageSaveData.EchelonInfos != null
-            && stageSaveData.EchelonInfos.TryGetValue(req.EchelonEntityId, out var echelon)
-            && stageSaveData.StrategyObjects is { Count: > 0 })
+        if (stageSaveData.EchelonInfos == null
+            || !stageSaveData.EchelonInfos.TryGetValue(req.EchelonEntityId, out var echelon))
         {
-            var objectExcels = _excelService.GetTable<CampaignStrategyObjectExcelT>();
-            var here = stageSaveData.StrategyObjects.Values
-                .FirstOrDefault(x => LocationKey(x.Location) == LocationKey(echelon.Location));
-
-            if (here != null)
-            {
-                var hereExcel = objectExcels.FirstOrDefault(x => x.Id == here.Id);
-
-                if (hereExcel != null && hereExcel.PortalId != 0)
-                {
-                    // pairs share a PortalId; the landing side is whichever partner is not a one-way enterance, which also covers the plain two-way portals
-                    var exit = stageSaveData.StrategyObjects.Values
-                        .Where(x => x.EntityId != here.EntityId)
-                        .FirstOrDefault(x =>
-                        {
-                            var excel = objectExcels.FirstOrDefault(e => e.Id == x.Id);
-                            return excel != null && excel.PortalId == hereExcel.PortalId
-                                && excel.StrategyObjectType != StrategyObjectType.PortalOneWayEnterance;
-                        });
-
-                    if (exit?.Location != null)
-                        echelon.Location = new HexLocation2D { x = exit.Location.x, y = exit.Location.y, z = exit.Location.z };
-                }
-            }
+            throw new WebAPIException(WebAPIErrorCode.CampaignStageEchelonNotFound, $"Echelon {req.EchelonEntityId} is not on the map");
         }
+
+        var objectExcels = _excelService.GetTable<CampaignStrategyObjectExcelT>();
+        var strategies = stageSaveData.StrategyObjects?.Values.ToList() ?? new List<Strategy>();
+
+        var entrance = strategies.FirstOrDefault(x => LocationKey(x.Location) == LocationKey(echelon.Location));
+        var entranceExcel = entrance == null ? null : objectExcels.FirstOrDefault(x => x.Id == entrance.Id);
+
+        if (entranceExcel == null
+            || (entranceExcel.StrategyObjectType != StrategyObjectType.Portal
+                && entranceExcel.StrategyObjectType != StrategyObjectType.PortalOneWayEnterance))
+        {
+            throw new WebAPIException(WebAPIErrorCode.CampaignPortalExitNotFound, $"Echelon {req.EchelonEntityId} is not standing on a portal");
+        }
+
+        var exitType = entranceExcel.StrategyObjectType == StrategyObjectType.PortalOneWayEnterance
+            ? StrategyObjectType.PortalOneWayExit
+            : StrategyObjectType.Portal;
+
+        var exit = strategies.FirstOrDefault(x =>
+        {
+            if (x.EntityId == entrance!.EntityId)
+                return false;
+
+            var excel = objectExcels.FirstOrDefault(e => e.Id == x.Id);
+            return excel != null && excel.StrategyObjectType == exitType && excel.PortalId == entranceExcel.PortalId;
+        });
+
+        if (exit == null || exit.Location == null)
+            throw new WebAPIException(WebAPIErrorCode.CampaignPortalExitNotFound, $"Portal {entranceExcel.PortalId} has no counterpart on this map");
+
+        var occupied = stageSaveData.EchelonInfos.Values.Any(x => x.EntityId != echelon.EntityId && LocationKey(x.Location) == LocationKey(exit.Location));
+        if (occupied)
+            throw new WebAPIException(WebAPIErrorCode.CampaignCannotReachDestination, "The portal exit is occupied");
+
+        // fresh HexLocation2D rather than sharing the exit object's - both sit in the same save row and a later write through one would drag the other with it
+        echelon.Location = new HexLocation2D { x = exit.Location.x, y = exit.Location.y, z = exit.Location.z };
+
+        // the warp costs neither an action nor a slot in the movement queue; this one entry is the whole of what the client plays
+        stageSaveData.DisplayInfos = new List<HexaDisplayInfo>
+        {
+            new()
+            {
+                Type = HexaDisplayType.WarpUnit,
+                EntityId = req.EchelonEntityId,
+                Location = new HexLocation { x = exit.Location.x, y = exit.Location.y, z = exit.Location.z },
+            },
+        };
+
+        await CollectMapReward(context, stageSaveData, req.EchelonEntityId);
 
         context.CampaignMainStageSaves.Update(stageSaveData);
         await context.SaveChangesAsync();
@@ -490,6 +555,11 @@ public class ConcentrateCampaignManager
 
         if (stageSaveData == null)
             throw new InvalidOperationException($"Campaign stage save not found for stage {req.Summary.StageId}");
+        if (!stageSaveData.IsOpen)
+            throw new WebAPIException(WebAPIErrorCode.CampaignStagePlayLimit, "Campaign run is already closed");
+
+        await using var transaction = context.Database.CurrentTransaction == null
+            ? await context.Database.BeginTransactionAsync() : null;
 
         var campaignChapterExcels = _excelService.GetTable<CampaignChapterExcelT>();
         var chapterUniqueId = campaignChapterExcels.GetChapterIdFromStageId(req.Summary.StageId);
@@ -520,14 +590,26 @@ public class ConcentrateCampaignManager
         var isStageClear = false;
         var endBattleType = CampaignEndBattle.Win;
         var tacticWon = CheckIfCleared(req.Summary);
+        var isStageDefeat = false;
 
         if (!tacticWon)
         {
+            tacticRank = 0; // The result consumer treats a positive rank as a won tactic.
             if (stageSaveData.EchelonInfos != null)
                 stageSaveData.EchelonInfos.Remove(req.Summary.Group01Summary.TeamId);
+            stageSaveData.EngagedEnemyEntityId = 0;
+            if (stageSaveData.EchelonInfos is not { Count: > 0 })
+            {
+                isStageDefeat = true;
+                stageSaveData.IsOpen = false;
+                stageSaveData.CampaignState = CampaignState.Lose;
+                endBattleType = CampaignEndBattle.Lose;
+            }
         }
         else
         {
+            await CollectMapReward(context, stageSaveData, req.Summary.Group01Summary.TeamId);
+
             // The engaged unit is named by the EnemyIndex the client sent with Campaign_EnterTactic, never by anything in the battle summary: the summary's Group02 heroes carry character ids (7020201, ...) while EnemyInfos is keyed by hex entity id and holds campaign-unit ids (111110201, ...).
             // Matching Id against CharacterId can never be true, so nothing gets removed, EnemyClearCount stays at zero and the stage cannot be completed.
             if (stageSaveData.EnemyInfos != null &&
@@ -568,10 +650,11 @@ public class ConcentrateCampaignManager
 
         if (isStageClear)
         {
+            historyDb.TodayPlayCount = 1;
             // star conditions are stage properties, not battle ones: one for finishing at all, one for finishing inside the par turn count, one for how many tactics ranked S
             historyDb.Star1Flag = true;
-            historyDb.Star2Flag = stageExcel != null && stageSaveData.CurrentTurn <= stageExcel.StarConditionTurnCount;
-            historyDb.Star3Flag = stageExcel != null && stageSaveData.TacticRankSCount >= stageExcel.StarConditionTacticRankSCount;
+            historyDb.Star2Flag = stageExcel != null && stageSaveData.TacticRankSCount >= stageExcel.StarConditionTacticRankSCount;
+            historyDb.Star3Flag = stageExcel != null && stageSaveData.CurrentTurn <= stageExcel.StarConditionTurnCount;
             historyDb.ClearTurnRecord = stageSaveData.CurrentTurn;
             historyDb.TacticClearCountWithRankSRecord = stageSaveData.TacticRankSCount;
             historyDb.IsClearedEver = true;
@@ -597,7 +680,8 @@ public class ConcentrateCampaignManager
 
         // DisplayInfos is per-response, never an accumulation; the stage-clear entry carries the whole reward payload, so AttachStageClearForWire hangs it on the wire copy instead of persisting it in the save row.
         // exception: a tactic fought mid-enemy-phase interrupted the decision pass, so the enemies after the engaged one still owe their moves and this response is how the client gets them
-        if (wasEnemyPhase && !isStageClear)
+        stageSaveData.DisplayInfos = new List<HexaDisplayInfo>();
+        if (wasEnemyPhase && !isStageClear && !isStageDefeat)
         {
             DecideEnemyMoves(
                 await LoadStageMap(stageSaveData), stageSaveData, engagedEnemyId,
@@ -623,7 +707,7 @@ public class ConcentrateCampaignManager
         var historyMap = historyDb.ToMap(_mapper);
 
         var (parcelResult, clearReward) = await BuildTacticReward(
-            context, account, stageExcel, req.Summary, tacticWon, isStageClear, grantFirstClear, grantThreeStar);
+            context, account, stageSaveData, stageExcel, req.Summary, tacticWon, isStageClear, grantFirstClear, grantThreeStar);
 
         if (clearReward != null)
             clearReward.CampaignStageHistoryDB = historyMap;
@@ -633,6 +717,8 @@ public class ConcentrateCampaignManager
             context, account, stageSaveData, tacticWon, isStageClear,
             StarCount(historyDb) - starsBefore);
 
+        await context.SaveChangesAsync();
+        if (transaction != null) await transaction.CommitAsync();
         return (stageSaveData, historyMap, tacticRank, clearReward, endBattleType, parcelResult, missionProgresses);
     }
 
@@ -641,6 +727,7 @@ public class ConcentrateCampaignManager
     private async Task<(ParcelResultDB ParcelResult, StrategyClearRewardInfo? ClearReward)> BuildTacticReward(
         SchaleDataContext context,
         AccountDBServer account,
+        CampaignMainStageSaveDBServer save,
         CampaignStageExcelT? stageExcel,
         BattleSummary summary,
         bool tacticWon,
@@ -675,9 +762,35 @@ public class ConcentrateCampaignManager
             }
         }
 
-        // One BuildParcel call, deliberately: it opens its own transaction so a second call cannot nest inside it, and every call builds a fresh resolver whose DisplaySequence/ParcelForMission assignment would throw away the first call's. Order is official's: first-clear rows, drops, character exp, account exp, three-star rows.
+        var mapRewards = new Dictionary<long, List<ParcelInfo>>();
+        if (tacticWon && isStageClear)
+        {
+            var claimed = await context.GetAccountStrategyObjectHistories(account.ServerId)
+                .Select(x => x.StrategyObjectId).ToListAsync();
+            var objects = save.StrategyObjectRewards.Count == 0 ? new Dictionary<long, Strategy>()
+                : HexaMapService.AddHexaStrategyList((await LoadStageMap(save)).HexaStrageyList);
+            foreach (var obj in save.StrategyObjects) objects[obj.Key] = obj.Value;
+            foreach (var entry in save.StrategyObjectRewards)
+            {
+                // Reward dictionaries use map entity IDs; permanent history uses authored object IDs.
+                if (!objects.TryGetValue(entry.Key, out var obj))
+                    throw new InvalidOperationException($"Cannot resolve map reward entity {entry.Key}");
+                var excel = _excelService.GetTable<CampaignStrategyObjectExcelT>().First(x => x.Id == obj.Id);
+                if (excel.StrategyObjectType == StrategyObjectType.ParcelOneTimePerAccount)
+                {
+                    if (claimed.Contains(obj.Id)) continue;
+                    context.StrategyObjectHistories.Add(new StrategyObjectHistoryDBServer
+                        { AccountServerId = account.ServerId, StrategyObjectId = obj.Id });
+                    claimed.Add(obj.Id);
+                }
+                mapRewards[entry.Key] = entry.Value;
+            }
+        }
+
+        // One BuildParcel call keeps all grants in a single display/result payload. It participates in the tactic transaction, together with the once-per-account box history. Order is official's: first-clear rows, drops, character exp, account exp, three-star rows.
         // Two cosmetic differences remain and neither changes what is granted - ParcelHandler.Aggregate sums same-key parcels, so a drop of an equipment the first-clear row also awards arrives as one summed entry where official lists two, and currency drops stay in drop order rather than being flushed to the end of the list.
-        var granted = firstClear.Concat(drops).Concat(exp).Concat(threeStar).ToList();
+        var granted = firstClear.Concat(drops).Concat(exp).Concat(threeStar)
+            .Concat(ParcelResult.ConvertParcelResult(mapRewards.Values.SelectMany(x => x).ToList())).ToList();
         var resolver = await _parcelHandler.BuildParcel(context, account, granted);
 
         if (!isStageClear)
@@ -688,7 +801,7 @@ public class ConcentrateCampaignManager
             FirstClearReward = ToParcelInfos(firstClear),
             ThreeStarReward = ToParcelInfos(threeStar),
             // official sends these two on every clear, empty when there is nothing in them; the four [JsonIgnore]'d lists on this type stay null so they drop off the wire
-            StrategyObjectRewards = new Dictionary<long, List<ParcelInfo>>(),
+            StrategyObjectRewards = mapRewards,
             EventContentBonusReward = new List<ParcelInfo>(),
             ParcelResultDB = resolver.ParcelResult,
         });
@@ -788,7 +901,7 @@ public class ConcentrateCampaignManager
         StrategyClearRewardInfo? clearReward,
         CampaignEndBattle endBattleType = CampaignEndBattle.Win)
     {
-        if (clearReward == null)
+        if (clearReward == null && endBattleType != CampaignEndBattle.Lose)
             return save;
 
         save.DisplayInfos = new List<HexaDisplayInfo>
@@ -800,7 +913,11 @@ public class ConcentrateCampaignManager
                 Parameter = (long)(endBattleType == CampaignEndBattle.None
                     ? CampaignEndBattle.Win
                     : endBattleType),
-                StageRewardInfo = clearReward,
+                StageRewardInfo = clearReward ?? new StrategyClearRewardInfo
+                {
+                    FirstClearReward = new(), ThreeStarReward = new(), StrategyObjectRewards = new(),
+                    EventContentBonusReward = new(), ParcelResultDB = new(),
+                },
             },
         };
 
@@ -924,6 +1041,11 @@ public class ConcentrateCampaignManager
         var stageSaveData = await GetConcentrateCampaign(context, account, req.StageUniqueId);
         if (stageSaveData == null)
             throw new InvalidOperationException($"Campaign stage save not found for stage {req.StageUniqueId}");
+
+        // Also recovers an open run left standing on a box by an older server.
+        if (stageSaveData.CampaignState == CampaignState.PlayerPhase)
+            foreach (var entityId in stageSaveData.EchelonInfos.Keys)
+                await CollectMapReward(context, stageSaveData, entityId);
 
         if (stageSaveData.CampaignState == CampaignState.PlayerPhase)
         {
@@ -1230,8 +1352,7 @@ public class ConcentrateCampaignManager
         if (newHistoryDb.TacticClearCountWithRankSRecord > existHistoryDb.TacticClearCountWithRankSRecord)
             existHistoryDb.TacticClearCountWithRankSRecord = newHistoryDb.TacticClearCountWithRankSRecord;
 
-        existHistoryDb.TodayPlayCount += 1;
-        existHistoryDb.LastPlay = dateTime;
+        CampaignDailyPlays.Record(existHistoryDb, dateTime, newHistoryDb.TodayPlayCount);
 
         context.CampaignStageHistories.Update(existHistoryDb);
     }

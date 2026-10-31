@@ -134,3 +134,7 @@ device_libunity.so
 !/Shittim-Server/config/**
 
 /reports
+/docs
+/Shittim-Server.Tests
+/ShittimControlCenter/test
+/Shittim-Server.Tests

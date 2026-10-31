@@ -14,6 +14,13 @@ using Schale.MX.TableBoard;
 
 namespace Schale.MX.GameLogic.DBModel
 {
+    public class AccountLimitedGachaDB
+    {
+        public long Id { get; set; }
+        public DateTime StartDate { get; set; }
+        public DateTime EndDate { get; set; }
+    }
+
     public struct CharacterWeapon
     {
         public long UniqueId { get; set; }

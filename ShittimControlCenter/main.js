@@ -7,6 +7,7 @@ const os = require('os');
 const https = require('https');
 const http = require('http');
 const { createServerModeController } = require('./server-mode');
+const { createStartupProgress, waitForServerReady } = require('./startup');
 const { spawn, execFile } = require('child_process');
 const { extractZip, installTree, resumeInterruptedInstall, backupUserData, writeFileAtomic, selfUpdateMode, blockerAdvice } = require('./updater');
 const { resolveRepoRoot, pathsFor, firstExisting, componentVersions, findMitmBinDir, mitmExe, dotnetExe } = require('./paths');
@@ -84,6 +85,16 @@ const procs = { server: null, mitm: null };
 // when each child was spawned, and how long the server gets to bind its port before silence counts as a symptom. A source run compiles first, so it gets no deadline at all - there is no telling a long build from a hang.
 const started = { server: null, mitm: null, serverGraceMs: null };
 const LISTEN_GRACE_MS = 90_000;
+let serverStartup = null;
+
+function sampleServerStartup() {
+  if (!serverStartup) return Date.now();
+  const progressAt = serverStartup.sample();
+  if (started.server != null && started.serverGraceMs != null) {
+    started.serverGraceMs = progressAt - started.server + LISTEN_GRACE_MS;
+  }
+  return progressAt;
+}
 // a child that never spawned leaves nothing to ask about, so the failure has to outlive it or the next poll reports a tidy "stopped"
 const spawnFailed = { server: false, mitm: false };
 
@@ -94,7 +105,10 @@ function broadcast(channel, payload) {
 }
 
 function pipeLines(child, source) {
-  streamLines(child, (line) => broadcast('proc:log', { source, line }));
+  streamLines(child, (line) => {
+    if (source === 'server' && child === procs.server) serverStartup?.observe(line);
+    broadcast('proc:log', { source, line });
+  });
 }
 
 function killTree(child) {
@@ -174,6 +188,14 @@ function startServer(offline) {
   procs.server = child;
   started.server = Date.now();
   started.serverGraceMs = p.exePath ? LISTEN_GRACE_MS : null;
+  serverStartup = createStartupProgress({ readSizes: () => {
+    if (!p.exePath) return '';
+    const directory = path.join(path.dirname(p.exePath), 'Resources', 'Downloaded');
+    return ['ExcelDB.db', 'Excel.zip', 'HexaMap.zip', 'TableBoardMapData.zip'].map((name) => {
+      try { return fs.statSync(path.join(directory, `${name}.part`)).size; }
+      catch { return null; }
+    }).join(',');
+  } });
   spawnFailed.server = false;
   broadcast('proc:state', { server: 'starting', serverPid: child.pid });
   pipeLines(child, 'server');
@@ -384,18 +406,17 @@ function restoreOfficialClient() {
 
 async function waitForLocalServer() {
   const port = Number(readConfig().data?.ServerConfiguration?.HostPort || 5000);
-  const until = Date.now() + 90000;
-  while (Date.now() < until) {
-    if (!procs.server || spawnFailed.server) return { ok: false, error: 'Local server exited during startup. See the server log.' };
-    const ready = await new Promise((resolve) => {
+  const child = procs.server;
+  return waitForServerReady({
+    alive: () => !!child && procs.server === child && !spawnFailed.server,
+    progressAt: sampleServerStartup,
+    probe: () => new Promise((resolve) => {
       const req = http.get({ hostname: '127.0.0.1', port, path: '/health' }, (res) => { res.resume(); resolve(res.statusCode === 200); });
       req.on('error', () => resolve(false));
       req.setTimeout(1000, () => { req.destroy(); resolve(false); });
-    });
-    if (ready) return { ok: true };
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return { ok: false, error: 'Local server did not become ready in 90 seconds. See the server log.' };
+    }),
+    timeoutMs: LISTEN_GRACE_MS,
+  });
 }
 
 const serverModes = createServerModeController({
@@ -1492,15 +1513,18 @@ ipcMain.handle('updates:check', () => checkUpdates());
 ipcMain.handle('updates:apply', () => applyUpdate());
 ipcMain.handle('updates:rebuild', () => rebuildServer());
 ipcMain.handle('updates:checkSelf', () => checkSelfUpdate());
-ipcMain.handle('proc:status', () => ({
-  server: procs.server && !procs.server.killed ? 'running' : (spawnFailed.server ? 'failed' : 'stopped'),
-  mitm: procs.mitm && !procs.mitm.killed ? 'running' : (spawnFailed.mitm ? 'failed' : 'stopped'),
-  serverPid: procs.server && !procs.server.killed ? procs.server.pid : null,
-  mitmPid: procs.mitm && !procs.mitm.killed ? procs.mitm.pid : null,
-  serverStartedAt: started.server,
-  serverGraceMs: started.serverGraceMs,
-  mitmStartedAt: started.mitm,
-}));
+ipcMain.handle('proc:status', () => {
+  if (procs.server) sampleServerStartup();
+  return {
+    server: procs.server && !procs.server.killed ? 'running' : (spawnFailed.server ? 'failed' : 'stopped'),
+    mitm: procs.mitm && !procs.mitm.killed ? 'running' : (spawnFailed.mitm ? 'failed' : 'stopped'),
+    serverPid: procs.server && !procs.server.killed ? procs.server.pid : null,
+    mitmPid: procs.mitm && !procs.mitm.killed ? procs.mitm.pid : null,
+    serverStartedAt: started.server,
+    serverGraceMs: started.serverGraceMs,
+    mitmStartedAt: started.mitm,
+  };
+});
 
 ipcMain.handle('env:check', () => runEnvChecks());
 

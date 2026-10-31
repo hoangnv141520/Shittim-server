@@ -320,6 +320,11 @@ public class AccountHandler : ProtocolHandlerBase
 
         // Overflow AP stored before the OverChargeLimit clamp existed keeps the client's counter pinned at 999 no matter what is spent, because the client clamps the displayed value. Same repair-on-login idea: move the excess into the mailbox where official puts it.
         var currencyDb = db.GetAccountCurrencies(account.ServerId).FirstOrDefault();
+        if (currencyDb != null && ActionPointRegeneration.Apply(currencyDb, account, _excelService))
+        {
+            db.Currencies.Update(currencyDb);
+            await db.SaveChangesAsync();
+        }
         var apOverChargeLimit = _excelService.GetTable<CurrencyExcelT>().First(x => x.CurrencyType == CurrencyTypes.ActionPoint).OverChargeLimit;
         if (currencyDb != null && currencyDb.CurrencyDict[CurrencyTypes.ActionPoint] > apOverChargeLimit)
         {

@@ -74,7 +74,8 @@ public class ParcelHandler
         ParcelResultDB? parcelResultDB = null,
         bool isConsume = false)
     {
-        var parcelResolver = new ParcelResolver(context, account, _mapper, parcelResultDB, isConsume, _currencyExcels);
+        var parcelResolver = new ParcelResolver(context, account, _mapper, parcelResultDB, isConsume, _currencyExcels,
+            ActionPointRegeneration.Cap(_excelService, account.Level));
         if (parcelResultList.Count == 0)
             return parcelResolver;
 

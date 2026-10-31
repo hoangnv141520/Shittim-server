@@ -189,12 +189,13 @@ public class ShopHandler : ProtocolHandlerBase
             Cost = null 
         };
 
-        var (accountCurrency, _, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, req3);
+        var (accountCurrency, consumedItems, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, req3);
         var (itemDbList, gachaResults) = await _shopManager.CreateTenGacha(db, account, req3, gachaAmount);
 
         response.ParcelResultDB = new ParcelResultDB
         {
              AccountCurrencyDB = accountCurrency,
+             ItemDBs = consumedItems?.ToDictionary(x => x.ServerId, x => x) ?? new Dictionary<long, ItemDB>()
         };
 
         await db.SaveChangesAsync();
@@ -216,13 +217,15 @@ public class ShopHandler : ProtocolHandlerBase
             Cost = null
         };
 
-        var (accountCurrency, _, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, req3);
+        var (accountCurrency, consumedItems, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, req3);
         response.GemBonusRemain = accountCurrency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemBonus);
         response.GemPaidRemain = accountCurrency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemPaid);
 
         var (itemDbList, gachaResults) = await _shopManager.CreateTenGacha(db, account, req3, gachaAmount);
         response.GachaResults = gachaResults;
         response.AcquiredItems = itemDbList.ToMapList(_mapper);
+        if (consumedItems != null && consumedItems.Count > 0)
+            response.AcquiredItems.AddRange(consumedItems);
         response.UpdateTime = account.GameSettings.ServerDateTime();
 
         var recruitHistory = db.GetAccountRecruitHistory(account.ServerId)
@@ -275,13 +278,15 @@ public class ShopHandler : ProtocolHandlerBase
             return response;
         }
 
-        var (accountCurrency, _, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, request);
+        var (accountCurrency, consumedItems, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, request);
         response.GemBonusRemain = accountCurrency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemBonus);
         response.GemPaidRemain = accountCurrency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemPaid);
 
         var (itemDbList, gachaResults) = await _shopManager.CreateTenGacha(db, account, request, gachaAmount);
         response.GachaResults = gachaResults;
         response.AcquiredItems = itemDbList.ToMapList(_mapper);
+        if (consumedItems != null && consumedItems.Count > 0)
+            response.AcquiredItems.AddRange(consumedItems);
         response.UpdateTime = account.GameSettings.ServerDateTime();
 
         var recruitHistory = db.GetAccountRecruitHistory(account.ServerId)
@@ -405,13 +410,15 @@ public class ShopHandler : ProtocolHandlerBase
             return response;
         }
 
-        var (accountCurrency, _, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, req3);
+        var (accountCurrency, consumedItems, gachaAmount) = await _shopManager.ConsumeCurrency(db, account, req3);
         response.GemBonusRemain = accountCurrency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemBonus);
         response.GemPaidRemain = accountCurrency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemPaid);
 
         var (itemDbList, gachaResults) = await _shopManager.CreateTenGacha(db, account, req3, gachaAmount);
         response.GachaResults = gachaResults;
         response.AcquiredItems = itemDbList.ToMapList(_mapper);
+        if (consumedItems != null && consumedItems.Count > 0)
+            response.AcquiredItems.AddRange(consumedItems);
         response.UpdateTime = account.GameSettings.ServerDateTime();
 
         var recruitHistory = db.GetAccountRecruitHistory(account.ServerId)

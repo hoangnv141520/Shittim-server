@@ -95,6 +95,7 @@ namespace Shittim_Server.Services
                 }
 
                 Apply();
+                ClientOfflineCashShopPatch.Apply(gameAssemblyPath, logger);
             }
             catch (Exception ex)
             {
@@ -195,6 +196,7 @@ namespace Shittim_Server.Services
             if (!File.Exists(gameAssemblyPath))
                 return;
 
+            ClientOfflineCashShopPatch.Revert(gameAssemblyPath, logger);
             var data = File.ReadAllBytes(gameAssemblyPath);
             var restore = new List<(long Offset, BytePattern Target)>();
 

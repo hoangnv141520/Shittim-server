@@ -47,7 +47,8 @@
       "src/**/*",
       "Sprite/**/*",
       "package.json",
-      "server-mode.js"
+      "server-mode.js",
+      "startup.js"
     ],
     "win": {
       "target": [

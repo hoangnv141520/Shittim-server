@@ -35,7 +35,9 @@ public class ConsumeHandler
         if (consumeResultDB != null) consumeResultDatas.ConsumeResult = consumeResultDB;
         if (parcelResultDB != null) consumeResultDatas.ParcelResult = parcelResultDB;
 
-        await using var transaction = await context.Database.BeginTransactionAsync();
+        // A growth operation may own the transaction across both feeds and recipe costs.
+        await using var transaction = context.Database.CurrentTransaction == null
+            ? await context.Database.BeginTransactionAsync() : null;
         try
         {
             var consumeResolver = new ConsumeResolver(context, account, _excelTableService, consumeResultDatas, _mapper);
@@ -53,7 +55,8 @@ public class ConsumeHandler
         }
         catch (Exception)
         {
-            await transaction.RollbackAsync();
+            if (transaction != null)
+                await transaction.RollbackAsync();
             throw;
         }
     }
@@ -206,7 +209,7 @@ public class ConsumeResolver
         }
     }
 
-    public async Task FinalizeUpdates(IDbContextTransaction transaction)
+    public async Task FinalizeUpdates(IDbContextTransaction? transaction)
     {
         var accountCurrencyDB = Context.Currencies.First(x => x.AccountServerId == Account.ServerId);
         if (Account.Level != accountCurrencyDB.AccountLevel)
@@ -215,7 +218,8 @@ public class ConsumeResolver
         ConsumeResultData.ParcelResult.AccountCurrencyDB = accountCurrencyDB.ToMap(Mapper);
 
         await Context.SaveChangesAsync();
-        await transaction.CommitAsync();
+        if (transaction != null)
+            await transaction.CommitAsync();
 
         foreach (var equipment in _equipmentDBs.Values)
         {

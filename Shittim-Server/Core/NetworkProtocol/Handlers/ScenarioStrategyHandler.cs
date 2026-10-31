@@ -3,6 +3,7 @@ using BlueArchiveAPI.Services;
 using Schale.Data;
 using Schale.Data.GameModel;
 using Schale.Data.ModelMapping;
+using Schale.FlatData;
 using Schale.MX.Campaign;
 using Schale.MX.Campaign.HexaTileMapEvent;
 using Schale.MX.GameLogic.DBModel;
@@ -73,7 +74,13 @@ public class ScenarioStrategyHandler : ProtocolHandlerBase
 
     private async Task<CampaignMainStageSaveDBServer> CreateStoryStrategySave(SchaleDataContext db, AccountDBServer account, long stageUniqueId)
     {
-        var hexaData = await _hexaMapService.LoadState(stageUniqueId);
+        var stage = _excelService.GetTable<StoryStrategyExcelT>().FirstOrDefault(x => x.Id == stageUniqueId)
+            ?? throw new InvalidOperationException($"Story strategy stage {stageUniqueId} not found");
+        if (string.IsNullOrWhiteSpace(stage.StrategyMap))
+            throw new InvalidOperationException($"Story strategy stage {stageUniqueId} has no strategy map");
+        var hexaData = await _hexaMapService.LoadState(stage.StrategyMap);
+        if (hexaData.HexaTileList is not { Count: > 0 })
+            throw new InvalidOperationException($"Story strategy map {stage.StrategyMap} is missing or empty");
 
         // entering a stage abandons whatever the player was in before it - only one campaign run can be open at a time, and the new one is what ContentSave_Get owes from here on
         await _concentrateCampaignManager.CloseConcentrateCampaigns(db, account);
@@ -96,6 +103,7 @@ public class ScenarioStrategyHandler : ProtocolHandlerBase
             DeployedEchelonInfos = new List<HexaUnit>(),
             CreateTime = account.GameSettings.ServerDateTime(),
             StageUniqueId = stageUniqueId,
+            StrategyMap = stage.StrategyMap,
             StageEntranceFee = [],
             EnemyKillCountByUniqueId = new(),
             IsOpen = true
@@ -221,11 +229,20 @@ public class ScenarioStrategyHandler : ProtocolHandlerBase
         var isStageClear = false;
         var endBattleType = CampaignEndBattle.Win;
         var tacticWon = !request.Summary.IsAbort && request.Summary.EndType == BattleEndType.Clear;
+        var isStageDefeat = false;
 
         if (!tacticWon)
         {
             if (stageSave.EchelonInfos != null)
                 stageSave.EchelonInfos.Remove(request.Summary.Group01Summary.TeamId);
+            stageSave.EngagedEnemyEntityId = 0;
+            if (stageSave.EchelonInfos is not { Count: > 0 })
+            {
+                isStageDefeat = true;
+                stageSave.IsOpen = false;
+                stageSave.CampaignState = CampaignState.Lose;
+                endBattleType = CampaignEndBattle.Lose;
+            }
         }
         else
         {
@@ -262,7 +279,7 @@ public class ScenarioStrategyHandler : ProtocolHandlerBase
                 stageSave.IsOpen = false;
         }
 
-        if (wasEnemyPhase && !isStageClear)
+        if (wasEnemyPhase && !isStageClear && !isStageDefeat)
         {
             ConcentrateCampaignManager.DecideEnemyMoves(
                 await _concentrateCampaignManager.LoadStageMap(stageSave), stageSave, engagedEnemyId,

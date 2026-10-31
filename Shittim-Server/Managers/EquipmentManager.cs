@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using BlueArchiveAPI.Services;
 using Schale.Data;
 using Schale.Data.GameModel;
@@ -109,20 +110,21 @@ namespace Shittim_Server.Managers
         public async Task<(EquipmentDBServer, ParcelResultDB, ConsumeResultDB)> EquipmentTierUp(
             SchaleDataContext context, AccountDBServer account, EquipmentItemTierUpRequest req)
         {
+            await using var transaction = await context.Database.BeginTransactionAsync();
             List<ParcelResult> parcelResults = [];
-            var targetEquipment = context.Equipments.FirstOrDefault(x => x.ServerId == req.TargetEquipmentServerId)
+            var targetEquipment = context.Equipments.FirstOrDefault(x => x.AccountServerId == account.ServerId && x.ServerId == req.TargetEquipmentServerId)
                 ?? throw new WebAPIException(WebAPIErrorCode.EquipmentNotFound);
             var currentEquipmentExcel = equipmentExcels.FirstOrDefault(x => x.Id == targetEquipment.UniqueId)
                 ?? throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound);
-            EquipmentService.CreateRecipes(parcelResults, recipeIngredientExcels, currentEquipmentExcel.RecipeId);
+            AddTierUpRecipe(parcelResults, currentEquipmentExcel.RecipeId);
             var nextEquipmentExcel = equipmentExcels.FirstOrDefault(x => x.Id == currentEquipmentExcel.NextTierEquipment)
                 ?? throw new WebAPIException(WebAPIErrorCode.EquipmentCannotTierUp);
 
+            ValidateTierUpCosts(context, account, parcelResults);
             targetEquipment.UniqueId = nextEquipmentExcel.Id;
             targetEquipment.Tier = (int)nextEquipmentExcel.TierInit;
-            await context.SaveChangesAsync();
-
             var parcelResolver = await parcelHandler.BuildParcel(context, account, parcelResults, isConsume: true);
+            await context.SaveChangesAsync();
 
             // Official's tier-up carries ConsumeResultDB alongside ParcelResultDB - without it the client keeps showing the spent ingredients until the next full list. The resolver's post-consume stacks are exactly the "remaining counts" official reports.
             var consumeResult = new ConsumeResultDB
@@ -133,12 +135,15 @@ namespace Shittim_Server.Managers
                     .ToDictionary(x => x.Key, x => x.Value.StackCount),
             };
 
+            MergeRecipeConsumption(parcelResolver.ParcelResult, consumeResult);
+            await transaction.CommitAsync();
             return (targetEquipment, parcelResolver.ParcelResult, consumeResult);
         }
 
         public async Task<(List<EquipmentDBServer>, GearDBServer?, ConsumeResultDB, ParcelResultDB)> EquipmentBatchGrowth(
             SchaleDataContext context, AccountDBServer account, EquipmentBatchGrowthRequest req)
         {
+            await using var transaction = await context.Database.BeginTransactionAsync();
             List<EquipmentDBServer> equipmentDBs = [];
             GearDBServer gearDB = null;
             ConsumeResultDB consumeResultDB = new ConsumeResultDatas().ConsumeResult;
@@ -147,9 +152,12 @@ namespace Shittim_Server.Managers
             List<ParcelResult> parcelResults = [];
             if (req.EquipmentBatchGrowthRequestDBs.Count != 0)
             {
+                if (req.EquipmentBatchGrowthRequestDBs.Select(x => x.TargetServerId).Distinct().Count()
+                    != req.EquipmentBatchGrowthRequestDBs.Count)
+                    throw new WebAPIException(WebAPIErrorCode.EquipmentBatchGrowthNotValid);
                 foreach (var batchGrowthDB in req.EquipmentBatchGrowthRequestDBs)
                 {
-                    var targetEquipment = context.Equipments.FirstOrDefault(x => x.ServerId == batchGrowthDB.TargetServerId)
+                    var targetEquipment = context.Equipments.FirstOrDefault(x => x.AccountServerId == account.ServerId && x.ServerId == batchGrowthDB.TargetServerId)
                         ?? throw new WebAPIException(WebAPIErrorCode.EquipmentNotFound);
                     var currentEquipmentExcel = equipmentExcels.FirstOrDefault(x => x.Id == targetEquipment.UniqueId)
                         ?? throw new WebAPIException(WebAPIErrorCode.DataEntityNotFound);
@@ -159,12 +167,16 @@ namespace Shittim_Server.Managers
                     var newEquipmentExcel = currentEquipmentExcel;
                     if (batchGrowthDB.AfterTier > targetEquipment.Tier)
                     {
-                        var equipmentDatas = allEquipmentCategory.GetEquipmentByTierUpgrade(targetEquipment.Tier, batchGrowthDB.AfterTier);
-                        if (equipmentDatas.Count == 0)
-                            throw new WebAPIException(WebAPIErrorCode.EquipmentBatchGrowthNotValid);
-
-                        EquipmentService.CreateRecipes(parcelResults, recipeIngredientExcels, equipmentDatas);
-                        newEquipmentExcel = equipmentDatas.Last();
+                        // Each recipe belongs to the source tier, as in single-tier growth.
+                        while ((long)newEquipmentExcel.TierInit < batchGrowthDB.AfterTier)
+                        {
+                            var next = allEquipmentCategory.FirstOrDefault(x => x.Id == newEquipmentExcel.NextTierEquipment);
+                            if (next == null || next.TierInit <= newEquipmentExcel.TierInit
+                                || (long)next.TierInit > batchGrowthDB.AfterTier)
+                                throw new WebAPIException(WebAPIErrorCode.EquipmentBatchGrowthNotValid);
+                            AddTierUpRecipe(parcelResults, newEquipmentExcel.RecipeId);
+                            newEquipmentExcel = next;
+                        }
                         targetEquipment.UniqueId = newEquipmentExcel.Id;
                         finalTier = (int)newEquipmentExcel.TierInit;
                     }
@@ -187,14 +199,14 @@ namespace Shittim_Server.Managers
 
             if (req.GearTierUpRequestDB != null)
             {
-                var targetGear = context.Gears.FirstOrDefault(x => x.ServerId == req.GearTierUpRequestDB.TargetServerId)
+                var targetGear = context.Gears.FirstOrDefault(x => x.AccountServerId == account.ServerId && x.ServerId == req.GearTierUpRequestDB.TargetServerId)
                     ?? throw new WebAPIException(WebAPIErrorCode.CharacterGearNotFound);
                 var targetCharacter = context.Characters.FirstOrDefault(x => x.ServerId == targetGear.BoundCharacterServerId)
                     ?? throw new WebAPIException(WebAPIErrorCode.CharacterNotFound);
                 var characterGears = characterGearExcels.GetCharacterGearExcelByCharacterId(targetCharacter.UniqueId);
                 var characterGear = characterGears.FirstOrDefault(x => x.Tier == targetGear.Tier + 1)
                     ?? throw new WebAPIException(WebAPIErrorCode.CharacterGearCannotTierUp);
-                EquipmentService.CreateRecipes(parcelResults, recipeIngredientExcels, characterGear.RecipeId);
+                AddTierUpRecipe(parcelResults, characterGear.RecipeId);
 
                 targetGear.UniqueId = characterGear.Id;
                 targetGear.Tier = (int)characterGear.Tier;
@@ -203,10 +215,71 @@ namespace Shittim_Server.Managers
                 gearDB = targetGear;
             }
 
+            ValidateTierUpCosts(context, account, parcelResults);
             var parcelResolver = await parcelHandler.BuildParcel(context, account, parcelResults, parcelResultDB, true);
             await context.SaveChangesAsync();
+            MergeRecipeConsumption(parcelResolver.ParcelResult, consumeResultDB);
 
+            await transaction.CommitAsync();
             return (equipmentDBs, gearDB, consumeResultDB, parcelResultDB);
+        }
+
+        private void AddTierUpRecipe(List<ParcelResult> costs, long recipeId)
+        {
+            if (recipeId == 0 || !recipeIngredientExcels.Any(x => x.Id == recipeId))
+                throw new WebAPIException(WebAPIErrorCode.EquipmentCannotTierUp, "Tier-up recipe not found");
+            EquipmentService.CreateRecipes(costs, recipeIngredientExcels, recipeId);
+        }
+
+        private static void MergeRecipeConsumption(ParcelResultDB parcels, ConsumeResultDB consume)
+        {
+            consume.UsedEquipmentServerIdAndRemainingCounts ??= [];
+            consume.UsedItemServerIdAndRemainingCounts ??= [];
+            consume.RemovedEquipmentServerIds ??= [];
+            consume.RemovedItemServerIds ??= [];
+            foreach (var (id, equipment) in parcels.EquipmentDBs ?? [])
+                consume.UsedEquipmentServerIdAndRemainingCounts[id] = equipment.StackCount;
+            foreach (var (id, item) in parcels.ItemDBs ?? [])
+                consume.UsedItemServerIdAndRemainingCounts[id] = item.StackCount;
+            foreach (var id in parcels.RemovedEquipmentIds ?? [])
+            {
+                consume.UsedEquipmentServerIdAndRemainingCounts[id] = 0;
+                if (!consume.RemovedEquipmentServerIds.Contains(id)) consume.RemovedEquipmentServerIds.Add(id);
+            }
+            foreach (var id in parcels.RemovedItemIds ?? [])
+            {
+                consume.UsedItemServerIdAndRemainingCounts[id] = 0;
+                if (!consume.RemovedItemServerIds.Contains(id)) consume.RemovedItemServerIds.Add(id);
+            }
+        }
+
+        private static void ValidateTierUpCosts(SchaleDataContext context, AccountDBServer account, List<ParcelResult> costs)
+        {
+            foreach (var cost in costs.Aggregate())
+            {
+                if (cost.Amount <= 0)
+                    throw new WebAPIException(WebAPIErrorCode.EquipmentCannotTierUp);
+                long held = cost.Type switch
+                {
+                    ParcelType.Equipment => context.Equipments.Where(x => x.AccountServerId == account.ServerId
+                        && x.UniqueId == cost.Id && x.BoundCharacterServerId == 0).Select(x => x.StackCount).FirstOrDefault(),
+                    ParcelType.Item => context.Items.Where(x => x.AccountServerId == account.ServerId
+                        && x.UniqueId == cost.Id).Select(x => x.StackCount).FirstOrDefault(),
+                    ParcelType.Currency => CurrencyBalance(context, account.ServerId, (CurrencyTypes)cost.Id),
+                    _ => throw new WebAPIException(WebAPIErrorCode.EquipmentCannotTierUp)
+                };
+                if (held < cost.Amount)
+                    throw new WebAPIException(WebAPIErrorCode.EquipmentCannotTierUp, "Insufficient tier-up materials or currency");
+            }
+        }
+
+        private static long CurrencyBalance(SchaleDataContext context, long accountId, CurrencyTypes type)
+        {
+            var currency = context.Currencies.FirstOrDefault(x => x.AccountServerId == accountId);
+            if (currency == null) return 0;
+            return type == CurrencyTypes.Gem
+                ? currency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemPaid) + currency.CurrencyDict.GetValueOrDefault(CurrencyTypes.GemBonus)
+                : currency.CurrencyDict.GetValueOrDefault(type);
         }
     }
 }

@@ -55,6 +55,7 @@ namespace Shittim_Server.Managers
             SchaleDataContext context, AccountDBServer account, long stageUniqueId)
         {
             var campaignExcel = _campaignStageExcels.GetCampaignStageId(stageUniqueId);
+            await CampaignDailyPlays.CheckHardLimit(context, account, campaignExcel, 1, _excelService);
             var parcelInfos = new ParcelResult(
                 campaignExcel.StageEnterCostType, 
                 campaignExcel.StageEnterCostId, 
@@ -272,6 +273,7 @@ namespace Shittim_Server.Managers
             }
 
             var dailyLimit = _excelService.GetTable<ConstCommonExcelT>().First().HardAdventurePlayCountRecoverDailyNumber;
+            CampaignDailyPlays.Reset(historyDb, account.GameSettings.ServerDateTime());
             if (historyDb.TodayPurchasePlayCountHardStage >= dailyLimit)
                 throw new WebAPIException(WebAPIErrorCode.CampaignStagePlayLimit, $"Stage {stageUniqueId} has no purchases left today");
 
@@ -289,6 +291,7 @@ namespace Shittim_Server.Managers
             }
 
             historyDb.TodayPurchasePlayCountHardStage++;
+            historyDb.LastPlay = account.GameSettings.ServerDateTime();
 
             await context.SaveChangesAsync();
 
@@ -338,8 +341,7 @@ namespace Shittim_Server.Managers
             existHistoryDb.Star3Flag = existHistoryDb.Star3Flag || newHistoryDb.Star3Flag;
             existHistoryDb.IsClearedEver = existHistoryDb.IsClearedEver || newHistoryDb.IsClearedEver;
 
-            existHistoryDb.TodayPlayCount += 1;
-            existHistoryDb.LastPlay = dateTime;
+            CampaignDailyPlays.Record(existHistoryDb, dateTime, newHistoryDb.TodayPlayCount);
 
             context.CampaignStageHistories.Update(existHistoryDb);
         }

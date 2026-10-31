@@ -50,6 +50,9 @@ public class ContentSweepHandler : ProtocolHandlerBase
     {
         var account = await _sessionService.GetAuthenticatedUser(db, request.SessionKey);
 
+        if (request.Count is <= 0 or > 10_000)
+            throw new WebAPIException(WebAPIErrorCode.InvalidSweepRequest, "Invalid sweep count");
+
         return request.Content switch
         {
             ContentType.WeekDungeon => await SweepWeekDungeon(db, account, request, response),
@@ -86,6 +89,8 @@ public class ContentSweepHandler : ProtocolHandlerBase
             throw new WebAPIException(WebAPIErrorCode.ContentSweepNotOpened, "Event sweep requires a three-star clear");
 
         var cost = checked((long)stage.StageEnterCostAmount * request.Count);
+        var currencies = await db.Currencies.FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId);
+        if (currencies != null) ActionPointRegeneration.Apply(currencies, account, _excelService);
         var available = stage.StageEnterCostType switch
         {
             ParcelType.Currency => (await db.Currencies.FirstOrDefaultAsync(x => x.AccountServerId == account.ServerId))?
@@ -117,8 +122,7 @@ public class ContentSweepHandler : ProtocolHandlerBase
         var result = await _parcelHandler.BuildParcel(db, account, allRewards);
 
         var now = account.GameSettings.ServerDateTime();
-        history.TodayPlayCount += request.Count;
-        history.LastPlay = now;
+        CampaignDailyPlays.Record(history, now, request.Count);
         await db.SaveChangesAsync();
         if (transaction != null) await transaction.CommitAsync();
 
@@ -142,8 +146,11 @@ public class ContentSweepHandler : ProtocolHandlerBase
         var gachaElementExcels = _excelService.GetTable<GachaElementExcelT>();
 
         var stageExcel = campaignStageExcels.GetCampaignStageId(request.StageId);
+        await using var transaction = db.Database.CurrentTransaction == null
+            ? await db.Database.BeginTransactionAsync() : null;
+        await CampaignDailyPlays.CheckHardLimit(db, account, stageExcel, request.Count, _excelService);
 
-        var apCost = stageExcel.StageEnterCostAmount * request.Count;
+        var apCost = checked((long)stageExcel.StageEnterCostAmount * request.Count);
         var apCostParcel = new ParcelResult(stageExcel.StageEnterCostType, stageExcel.StageEnterCostId, apCost);
         await _parcelHandler.BuildParcel(db, account, apCostParcel, isConsume: true);
 
@@ -183,8 +190,7 @@ public class ContentSweepHandler : ProtocolHandlerBase
         }
         else
         {
-            historyDb.TodayPlayCount += (int)request.Count;
-            historyDb.LastPlay = dateTime;
+            CampaignDailyPlays.Record(historyDb, dateTime, request.Count);
             db.CampaignStageHistories.Update(historyDb);
         }
 
@@ -192,6 +198,7 @@ public class ContentSweepHandler : ProtocolHandlerBase
 
         response.ClearParcels = clearParcels;
         response.BonusParcels = bonusParcels;
+        if (transaction != null) await transaction.CommitAsync();
         response.ParcelResult = parcelResult.ParcelResult;
         response.CampaignStageHistoryDB = historyDb.ToMap(_mapper);
 

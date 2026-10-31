@@ -6683,6 +6683,7 @@ namespace Schale.MX.NetworkProtocol
         public override Protocol Protocol { get => Protocol.Shop_GachaRecruitList; }
         public List<ShopRecruitDB>? ShopRecruits { get; set; }
         public List<ShopFreeRecruitHistoryDB>? ShopFreeRecruitHistoryDBs { get; set; }
+        public List<AccountLimitedGachaDB> AccountLimitedGachaDBs { get; set; } = [];
     }
 
     public class ShopBuyRefreshMerchandiseRequest : RequestPacket
